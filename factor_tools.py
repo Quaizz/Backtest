@@ -4,9 +4,13 @@ import duckdb
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+import os
+from tqdm import tqdm
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-
+'''
 def get_trading_dates(start_date, end_date, duck_conn):
     """
     Retrieve all trading dates between start_date and end_date from CRSP data.
@@ -29,6 +33,7 @@ def get_trading_dates(start_date, end_date, duck_conn):
     return duck_conn.execute(
         dates_query.format(start_date=start_date, end_date=end_date)
     ).fetchdf()['trading_date'].tolist()
+'''
 
 def get_all_investment_universe(date_str, duck_conn):
     """
@@ -244,3 +249,533 @@ def analyze_factor_over_time(factor_name, start_date, end_date, base_folder="fac
         return stats_df
     
     return None
+
+
+def get_trading_dates(start_date, end_date, db_conn):
+    """
+    Get list of trading dates from CRSP calendar.
+    
+    Parameters:
+    -----------
+    start_date : str
+        Start date in 'YYYY-MM-DD' format
+    end_date : str
+        End date in 'YYYY-MM-DD' format
+    db_conn : duckdb.DuckDBPyConnection
+        Active connection to DuckDB database
+    
+    Returns:
+    --------
+    list : Trading dates in YYYY-MM-DD format
+    """
+    trading_dates_query = f"""
+        SELECT DISTINCT caldt as trading_date
+        FROM metaexchangecalendar
+        WHERE tradingflg = 'Y'
+        AND caldt BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+        ORDER BY caldt
+    """
+    return db_conn.execute(
+        trading_dates_query.format(start_date=start_date, end_date=end_date)
+    ).fetchdf()['trading_date'].tolist()
+
+
+def sql_base_data(date, parquet_path,db_conn):
+    """
+    Load and cache basic market data for a single date.
+    Uses dlycaldt as the date column which is specific to dsf_v2 table.
+    
+    Parameters:
+    -----------
+    date : str
+        Date in 'YYYY-MM-DD' format
+    parquet_path : str
+        Path template for saving parquet files
+        
+    Returns:
+    --------
+    DataFrame : Daily stock data with standardized formatting
+    """
+    query = f"""
+        SELECT 
+            s.permno,
+            s.dlycaldt as date,
+            s.dlyprc,
+            s.dlyprevprc,
+            s.dlyret,
+            s.dlyretmissflg,
+            s.dlycap,
+            s.tradingstatusflg,
+            s.securitytype,
+            s.sharetype,
+            s.dlyclose,
+            s.dlyopen
+        FROM dsf_v2 s
+        WHERE s.dlycaldt = DATE '{date}'
+        ORDER BY s.dlycaldt
+    """
+    
+    # Execute query directly with f-string - no need for .format()
+    base_info_df = db_conn.execute(query).fetchdf()
+    
+
+    base_info_df.set_index('permno', inplace=True)
+    
+    # Convert date to YYYYMMDD format for parquet filename
+    parquet_date = pd.to_datetime(date).strftime('%Y%m%d')
+    
+    if len(base_info_df) > 0:
+        # Use the formatted date in the parquet path
+        base_info_df.to_parquet(parquet_path.format(parquet_date))
+    
+    return base_info_df
+'''
+def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data_path):
+    """
+    Create dataset for factor analysis, following the efficient patterns
+    of the Chinese version but adapted for US market needs.
+    """
+    db_conn = duckdb.connect(db_path, read_only=True)
+    
+    try:
+        trading_dates = get_trading_dates(start_date, end_date, db_conn)
+        
+        cache_dir = os.path.join('Data_all', 'Base_Data')
+        parquet_path = os.path.join(cache_dir, '{}.parquet')
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        data_df_dic = {}
+        for date in trading_dates:
+            if os.path.exists(parquet_path.format(date)):
+                base_df = pd.read_parquet(parquet_path.format(date))
+            else:
+                base_df = sql_base_data(date, parquet_path,db_conn)
+            
+            factor_df = load_factor_data(date, factor_name, factor_data_path)
+            # Set 'permno' as index for factor DataFrame
+            factor_df.set_index('permno', inplace=True)
+
+            if factor_df is not None:
+                data_df_dic[date] = pd.concat([base_df, factor_df], axis=1)
+        
+        return data_df_dic, trading_dates
+        
+    finally:
+        db_conn.close()
+'''
+def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data_path):
+    """
+    Create dataset for factor analysis with parallel processing.
+    Loads all stocks without filtering to allow flexibility in backtesting.
+    """
+    db_conn = duckdb.connect(db_path, read_only=True)
+    
+    try:
+        # Get previous trading date before start_date
+        prev_date_query = f"""
+            SELECT MAX(caldt) as prev_date
+            FROM metaexchangecalendar
+            WHERE tradingflg = 'Y'
+            And caldt < DATE '{start_date}'
+        """
+
+        prev_start_date = db_conn.execute(
+            prev_date_query, 
+        ).fetchone()[0]
+        
+        trading_dates = get_trading_dates(prev_start_date, end_date, db_conn)
+
+    
+
+        cache_dir = os.path.join('Data_all', 'Base_Data')
+        parquet_path = os.path.join(cache_dir, '{}.parquet')
+        os.makedirs(cache_dir, exist_ok=True)
+
+        data_df_dic = {}
+        
+        # Process each date sequentially with detailed logging
+        for date in tqdm(trading_dates, desc="Processing dates"):
+            try:
+                #print(f"\nProcessing date: {date}")
+                
+                if os.path.exists(parquet_path.format(date)):
+                    #print(f"Loading cached data for {date}")
+                    base_df = pd.read_parquet(parquet_path.format(date))
+                else:
+                    #print(f"Getting base data for {date}")
+                    base_df = sql_base_data(date, parquet_path, db_conn)
+
+                #print(f"Loading factor data for {date}")
+                factor_df = load_factor_data(date, factor_name, factor_data_path)
+                
+                if factor_df is not None:
+                    #print(f"Combining data for {date}")
+                    factor_df.set_index('permno', inplace=True)
+                    data_df_dic[date] = pd.concat([base_df, factor_df], axis=1)
+                else:
+                    print(f"No factor data found for {date}")
+                        
+            except Exception as e:
+                print(f"\nError processing date {date}: {str(e)}")
+                print(f"Error type: {type(e)}")
+                import traceback
+                print(traceback.format_exc())
+                continue
+
+
+
+        return data_df_dic, trading_dates
+
+    finally:
+        db_conn.close()
+    '''
+    # Setup for parallel processing
+    cache_dir = os.path.join('Data_all', 'Base_Data')
+    parquet_path = os.path.join(cache_dir, '{}.parquet')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    def process_single_date(date):
+        """Process a single date using existing functions."""
+        try:
+            with duckdb.connect(db_path, read_only=True) as conn:
+                if os.path.exists(parquet_path.format(date)):
+                    base_df = pd.read_parquet(parquet_path.format(date))
+                else:
+                    base_df = sql_base_data(date, parquet_path, conn)
+
+                factor_df = load_factor_data(date, factor_name, factor_data_path)
+                if factor_df is not None:
+                    factor_df.set_index('permno', inplace=True)
+                    return date, pd.concat([base_df, factor_df], axis=1)
+                
+        except Exception as e:
+            print(f"Error processing date {date}: {str(e)}")
+        return None
+
+    num_workers = max(multiprocessing.cpu_count() - 1, 1)
+    data_df_dic = {}
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_single_date, date) for date in trading_dates]
+        
+        for future in tqdm(
+            as_completed(futures), 
+            total=len(futures),
+            desc="Processing dates"
+        ):
+            result = future.result()
+            if result is not None:
+                date, df = result
+                data_df_dic[date] = df
+
+    # Remove the previous date if it's not start_date
+    if trading_dates[0] < start_date:
+        trading_dates = trading_dates[1:]
+
+    return data_df_dic, trading_dates
+    '''
+
+def load_factor_data(date, factor_name, factor_data_path='factor_data'):
+    """
+    Load pre-calculated factor data from parquet file.
+    
+    Parameters:
+    -----------
+    date : str
+        Date in 'YYYY-MM-DD' format
+    factor_name : str
+        Name of the factor
+    base_path : str
+        Base directory for factor data
+        
+    Returns:
+    --------
+    DataFrame : Factor data for the date
+    """
+
+    # Convert date string to datetime and format it as YYYYMMDD
+    date_formatted = pd.to_datetime(date).strftime('%Y-%m-%d')
+
+    factor_file = Path(factor_data_path) / factor_name / f"{factor_name}_{date_formatted}.parquet"
+    
+    if not factor_file.exists():
+        print(f"File not found: {factor_file}")
+        return None
+        
+    return pd.read_parquet(factor_file)
+
+'''
+def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data_path):
+    """
+    Create complete dataset for factor analysis.
+    Maintains the efficient data loading patterns from the original implementation.
+    """
+    db_conn = duckdb.connect(db_path, read_only=True)
+    
+    try:
+        # Get all trading dates at once to minimize database calls
+        trading_dates = get_trading_dates(start_date, end_date, db_conn)
+        
+        # Setup data storage structure
+        cache_dir = os.path.join('Data_all', 'Base_Data')
+        parquet_path = os.path.join(cache_dir, '{}.parquet')
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Process each date efficiently
+        data_df_dic = {}
+        for date in trading_dates:
+            # Try loading cached data first
+            if os.path.exists(parquet_path.format(date)):
+                base_df = pd.read_parquet(parquet_path.format(date))
+            else:
+                base_df = sql_base_data(date, parquet_path, db_conn)
+            
+            # Load and combine factor data
+            factor_df = load_factor_data(date, factor_name, factor_data_path)
+            if factor_df is not None:
+                combined_data = pd.concat([base_df, factor_df], axis=1)
+                data_df_dic[date] = combined_data
+        
+        # Get price data efficiently in one operation
+        stock_price_df = get_all_stock_price(start_date, end_date, db_conn)
+        
+        return data_df_dic, stock_price_df, trading_dates
+        
+    finally:
+        db_conn.close()
+
+def get_all_stock_price(start_date, end_date, db_conn, price='dlyprc'):
+    """
+    Get price panel data efficiently using the groupby approach from the original implementation.
+    Adapted for CRSP data structure while maintaining the same efficient processing pattern.
+    """
+    query = f"""
+        SELECT 
+            permno,
+            dlycaldt,
+            '{price}' as price
+        FROM dsf_v2
+        WHERE dlycaldt BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+        ORDER BY date
+    """
+    
+    df = db_conn.execute(query, [start_date, end_date]).fetchdf()
+    
+    # Create price panel using efficient groupby operations
+    stock_groups = df.groupby('permno')
+    date_groups = df.groupby('date')
+    
+    stock_price_df = pd.DataFrame(
+        index=list(stock_groups.groups.keys()),
+        columns=list(date_groups.groups.keys())
+    )
+    
+    for stock, price_df in stock_groups:
+        price_df.set_index('date', inplace=True)
+        stock_price_df.loc[stock, :] = price_df['price']
+    
+    stock_price_df.columns = [date.strftime("%Y%m%d") for date in stock_price_df.columns]
+    return stock_price_df
+
+'''
+
+'''
+def get_stock_data(date, db_conn):
+    """
+    Get daily stock data and prepare it for merging without triggering progress bars.
+    """
+    query = f"""
+        SELECT 
+            s.permno,
+            s.dlyprc,
+            s.dlyprevprc,
+            s.dlyret,
+            s.dlyretmissflg,
+            s.dlycap,
+            s.tradingstatusflg,
+            s.securitytype,
+            s.sharetype,
+            s.dlyclose,
+            s.dlyopen
+        FROM dsf_v2 s
+        WHERE s.dlycaldt = DATE '{date}'
+    """
+    # Get data from database
+    stock_data = db_conn.execute(query.format(date=date)).fetchdf()
+    
+    # Convert to dictionary format which doesn't trigger progress bars
+    stock_data.set_index('permno', inplace=True)
+    
+    return stock_data
+
+def load_factor_data(date, factor_name, factor_data_path='factor_data'):
+    """
+    Load pre-calculated factor data from parquet file.
+    
+    Parameters:
+    -----------
+    date : str
+        Date in 'YYYY-MM-DD' format
+    factor_name : str
+        Name of the factor
+    base_path : str
+        Base directory for factor data
+        
+    Returns:
+    --------
+    DataFrame : Factor data for the date
+    """
+
+    # Convert date string to datetime and format it as YYYYMMDD
+    date_formatted = pd.to_datetime(date).strftime('%Y-%m-%d')
+
+    factor_file = Path(factor_data_path) / factor_name / f"{factor_name}_{date_formatted}.parquet"
+    
+    if not factor_file.exists():
+        print(f"File not found: {factor_file}")
+        return None
+        
+    return pd.read_parquet(factor_file)
+
+def get_price_data(start_date, end_date, db_conn):
+    """
+    Get price panel data from CRSP.
+    
+    Parameters:
+    -----------
+    start_date : str
+        Start date in 'YYYY-MM-DD' format
+    end_date : str
+        End date in 'YYYY-MM-DD' format
+    db_conn : duckdb.DuckDBPyConnection
+        Active connection to DuckDB database
+        
+    Returns:
+    --------
+    DataFrame : Panel of prices (permno × dates)
+    """
+    price_query = f"""
+        SELECT 
+            dlycaldt,
+            permno,
+            dlyprc as price
+        FROM dsf_v2
+        WHERE dlycaldt BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+    """
+    
+    price_df = db_conn.execute(
+        price_query.format(start_date=start_date, end_date=end_date)
+    ).fetchdf()
+    
+    # Reshape without using pivot
+    price_panel = (price_df
+        .set_index(['permno', 'date'])['price']
+        .unstack(level='date')
+    )
+    
+    return price_panel
+
+
+'''
+
+
+'''
+def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data_path):
+    """
+    Create complete dataset for factor analysis without progress bars.
+    """
+    db_conn = duckdb.connect(db_path, read_only=True)
+    
+    try:
+        trading_dates = get_trading_dates(start_date, end_date, db_conn)
+        print(f"Found {len(trading_dates)} trading dates")
+        
+        data_df_dic = {}
+        for i, date in enumerate(trading_dates):
+            print(f"Processing date {i+1}: {date}")
+            
+            factor_df = load_factor_data(date, factor_name, factor_data_path)
+            if factor_df is None:
+                continue
+            
+            print(f"Loading stock data for {date}")
+            stock_data = get_stock_data(date, db_conn)
+            
+            print(f"Merging data for {date}")
+            # Use join instead of merge to avoid progress bar
+            factor_df.set_index('permno', inplace=True)
+            combined_data = factor_df.join(stock_data, how='inner')
+            
+            data_df_dic[date] = combined_data
+            
+        print("Getting price panel data...")
+        stock_price_df = get_price_data(start_date, end_date, db_conn)
+        
+        return data_df_dic, stock_price_df, trading_dates
+        
+    finally:
+        db_conn.close()
+'''
+'''
+def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data_path):
+    """
+    Create complete dataset for factor analysis.
+    
+    Parameters:
+    -----------
+    start_date : str
+        Start date in 'YYYY-MM-DD' format
+    end_date : str
+        End date in 'YYYY-MM-DD' format
+    factor_name : str
+        Name of the factor
+    db_path : str
+        Path to DuckDB database
+        
+    Returns:
+    --------
+    tuple : (data_df_dic, stock_price_df, trading_dates)
+    """
+    # Connect to database
+    db_conn = duckdb.connect(db_path, read_only=True)
+    
+    try:
+        # Get trading dates
+        trading_dates = get_trading_dates(start_date, end_date, db_conn)
+        
+    
+        # Create data dictionary
+        data_df_dic = {}
+        total_dates = len(trading_dates)
+        
+        # Use simple progress tracking instead of tqdm
+        print(f"Processing {total_dates} trading dates...")
+        for i, date in enumerate(trading_dates):
+            if (i + 1) % 20 == 0:  # Print progress every 20 dates
+                print(f"Processed {i + 1}/{total_dates} dates ({((i + 1)/total_dates)*100:.1f}%)")
+                
+            # Load factor data
+            factor_df = load_factor_data(date, factor_name, factor_data_path)
+            if factor_df is None:
+                continue
+                
+            # Get stock data and merge
+            stock_data = get_stock_data(date, db_conn)
+            combined_data = pd.merge(
+                factor_df,
+                stock_data,
+                on='permno',
+                how='inner'
+            )
+            
+            data_df_dic[date] = combined_data
+        
+        print("Getting price panel data...")
+        stock_price_df = get_price_data(start_date, end_date, db_conn)
+        print("Data loading complete!")
+        
+        return data_df_dic, stock_price_df, trading_dates
+        
+    finally:
+        db_conn.close()
+'''
