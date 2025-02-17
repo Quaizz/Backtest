@@ -284,9 +284,14 @@ class USQuantileFactorAnalysis:
         return processed_df
 
     def cal_factor_func(self, factor_df):
-        """Calculate factor values - override for specific factors."""
-        factor_df['point1'] = factor_df[self.factor_list[0]]
-
+        """Calculate composite factor score from multiple factors"""
+        # Rank each factor
+        ranks = pd.DataFrame()
+        for factor in self.factor_list:
+            ranks[f"{factor}_rank"] = factor_df[factor].rank(ascending=self.factor_ascending)
+        
+        # Calculate composite score (average of ranks)
+        factor_df['point1'] = ranks.sum(axis=1)
 
     def calculate_daily_returns(self, date, current_data_df):
         """Calculate daily returns for existing positions."""
@@ -340,7 +345,7 @@ class USQuantileFactorAnalysis:
             (prev_data_df['dlyprc'] > 2)      # Price > $5
         ]
         
-        factor_df.dropna(subset=self.factor_list)
+        factor_df.dropna(subset=self.factor_list[0])
 
         # Calculate factors and sort
         self.cal_factor_func(factor_df)
@@ -1160,7 +1165,7 @@ class USQuantileFactorAnalysis:
         
         tableheight = num_years /8 
         # Create grid for plots, tables, and metrics (13 rows total)
-        gs = fig.add_gridspec(14, 2, height_ratios=[1, 1, 1, 1, 1, 1, 1, tableheight, tableheight, tableheight, tableheight, 0.5 ,1, 1])
+        gs = fig.add_gridspec(15, 2, height_ratios=[1, 1, 1, 1, 1, 1, 1, tableheight, tableheight, tableheight, tableheight, 0.35 ,1 ,1, 1])
         
         if interactive:
             # First 7 plots remain the same (0-6)
@@ -1264,8 +1269,14 @@ class USQuantileFactorAnalysis:
             ax_ic_stats.set_title('IC Statistics', pad=20)
         
 
+        # After the IC stats table and before the cumulative IC plot, add:
+        ax_rankic_series = fig.add_subplot(gs[12,:])
+        if interactive:
+            self.plot_rankic_series_interactive(ax_rankic_series)
+        else:
+            self.plot_rankic_series(ax_rankic_series)
 
-        ax_ic = fig.add_subplot(gs[12,:])
+        ax_ic = fig.add_subplot(gs[13,:])
         if interactive:
             # ... other interactive plots ...
             self.plot_cumulative_ic_interactive(ax_ic)
@@ -1274,10 +1285,10 @@ class USQuantileFactorAnalysis:
             self.plot_cumulative_ic(ax_ic)
         
         # Add turnover and metrics plots at the bottom (row 12)
-        ax_turnover = fig.add_subplot(gs[13, 0])
+        ax_turnover = fig.add_subplot(gs[14, 0])
         self.plot_turnover(ax_turnover)
         
-        ax_metrics = fig.add_subplot(gs[13, 1])
+        ax_metrics = fig.add_subplot(gs[14, 1])
         metrics = pd.DataFrame({
             'Annual Return (%)': self.annual_returns,
             'Sharpe Ratio': self.sharpe_ratios,
@@ -1315,6 +1326,108 @@ class USQuantileFactorAnalysis:
             return pd.DataFrame([stats])
         return None
     
+    def plot_rankic_series(self, ax=None):
+        """Plot rank IC time series."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Calculate mean rank IC
+        mean_rankic = np.mean(self.rankic_list)
+        pct_positive = np.mean(np.array(self.rankic_list) > 0) * 100
+        # Plot rank IC values
+        ax.plot(self.rebalance_date[1:len(self.rankic_list)+1], self.rankic_list, 
+                color='blue', linewidth=1)
+        
+        # Add horizontal lines at 0, 0.02, and -0.02
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax.axhline(y=0.02, color='gray', linestyle='--', linewidth=0.5)
+        ax.axhline(y=-0.02, color='gray', linestyle='--', linewidth=0.5)
+        
+
+        # Add mean rank IC line
+        ax.axhline(y=mean_rankic, color='red', linestyle='-', linewidth=1, 
+               label=f'Mean Rank IC: {mean_rankic:.3f}')
+    
+        ax.set_title('Rank IC Time Series')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Rank IC')
+        ax.grid(True)
+
+
+        # Create legend with more information
+        # Create legend with more information
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], color='blue', label=f'Rank IC (Mean: {mean_rankic:.3f}, {pct_positive:.1f}% Positive)'),
+            Line2D([0], [0], color='red', label=f'Mean = {mean_rankic:.3f}'),
+            Line2D([0], [0], color='gray', linestyle='--', label='±0.02 Bounds'),
+            Line2D([0], [0], color='black', label='Zero')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right')
+        
+
+        plt.xticks(rotation=45)
+        ax.xaxis.set_major_locator(plt.MaxNLocator(10))
+        
+        return ax
+
+    def plot_rankic_series_interactive(self, ax=None):
+        """Plot interactive rank IC time series."""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(12, 6))
+        else:
+            fig = ax.figure
+
+        # Calculate mean rank IC
+        mean_rankic = np.mean(self.rankic_list)  
+        pct_positive = np.mean(np.array(self.rankic_list) > 0) * 100
+
+        # Plot rank IC values
+        line = ax.plot(self.rebalance_date[1:len(self.rankic_list)+1], self.rankic_list, 
+                    color='blue', linewidth=1)[0]
+        
+        # Add horizontal lines
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax.axhline(y=0.02, color='gray', linestyle='--', linewidth=0.5)
+        ax.axhline(y=-0.02, color='gray', linestyle='--', linewidth=0.5)
+        # Add mean rank IC line
+        mean_line = ax.axhline(y=mean_rankic, color='red', linestyle='-', linewidth=1,
+                          label=f'Mean Rank IC: {mean_rankic:.3f}')
+        ax.set_title('Rank IC Time Series')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Rank IC')
+        ax.grid(True)
+        
+        # Create legend with more information
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], color='blue', label=f'Rank IC (Mean: {mean_rankic:.3f}, {pct_positive:.1f}% Positive)'),
+            Line2D([0], [0], color='red', label=f'Mean = {mean_rankic:.3f}'),
+            Line2D([0], [0], color='gray', linestyle='--', label='±0.02 Bounds'),
+            Line2D([0], [0], color='black', label='Zero')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right')
+        plt.xticks(rotation=45)
+        ax.xaxis.set_major_locator(plt.MaxNLocator(10))
+        
+        # Add hover annotations
+        cursor = mplcursors.cursor([line], hover=True)
+        
+        @cursor.connect("add")
+        def on_hover(sel):
+            x, y = sel.target
+            date_idx = np.abs(matplotlib.dates.date2num(self.rebalance_date[1:len(self.rankic_list)+1]) - x).argmin()
+            date_str = self.rebalance_date[date_idx + 1].strftime('%Y-%m-%d')
+            sel.annotation.set_text(
+                f"Date: {date_str}\n"
+                f"Rank IC: {y:.3f}"
+                f"Mean Rank IC: {mean_rankic:.3f}"
+            )
+            sel.annotation.get_bbox_patch().set(fc="white", alpha=0.8)
+        
+        return ax
+
+
     def plot_cumulative_ic(self, ax=None):
         """Plot cumulative IC."""
         if ax is None:
