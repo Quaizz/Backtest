@@ -1,4 +1,4 @@
-# A Daily Stock Backtesting Framework
+# Gnosiom - an open source end-to-end solution to factor investment research in US stocks
 
 ## Project Vision
 
