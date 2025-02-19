@@ -1397,7 +1397,7 @@ class USQuantileFactorAnalysis:
         ax.set_xlabel('Date')
         ax.set_ylabel('Rank IC')
         ax.grid(True)
-        
+
         # Create legend with more information
         from matplotlib.lines import Line2D
         legend_elements = [
@@ -1488,3 +1488,153 @@ class USQuantileFactorAnalysis:
             sel.annotation.get_bbox_patch().set(fc="white", alpha=0.8)
         
         return ax
+    
+    def save_performance_summary_pdfs(self, output_dir='performance_plots', dpi=2400):
+        """
+        Save each row of the performance summary plot as a separate high-resolution PDF.
+        
+        Parameters:
+        -----------
+        output_dir : str
+            Directory where PDF files will be saved
+        dpi : int
+            Resolution of the output PDFs
+        """
+        import os
+        from pathlib import Path
+        
+        # Create output directory if it doesn't exist
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Create individual figures for each row
+        row_names = [
+            'cumulative_returns',
+            'excess_returns',
+            'universe_excess_returns',
+            'long_short_strategy',
+            'long_universe_strategy',
+            'short_universe_strategy',
+            'long_benchmark_strategy',
+            'long_short_stats',
+            'long_universe_stats',
+            'short_universe_stats',
+            'long_benchmark_stats',
+            'ic_stats',
+            'rankic_series',
+            'cumulative_ic',
+            'turnover_metrics'
+        ]
+        
+        for i, row_name in enumerate(row_names):
+            fig = plt.figure(figsize=(16, 8))
+            
+            if i < 7:  # First 7 rows are plots
+                if i == 0:
+                    self.plot_cumulative_returns(plt.gca(), show_benchmark=True)
+                elif i == 1:
+                    self.plot_excess_returns(plt.gca())
+                elif i == 2:
+                    self.plot_universe_excess_returns(plt.gca())
+                elif i >= 3 and i <= 6:
+                    plot_types = ['long_short', 'long_universe', 'short_universe', 'long_benchmark']
+                    self.plot_strategy_analysis(plot_types[i-3], plt.gca())
+            
+            elif i >= 7 and i <= 10:  # Monthly statistics tables
+                strategies = ['long_short', 'long_universe', 'short_universe', 'long_benchmark']
+                ax = plt.gca()
+                ax.axis('off')
+                
+                stats_df = self.calculate_monthly_stats(strategies[i-7])
+                stats_df = stats_df.round(2)
+                
+                table = ax.table(
+                    cellText=stats_df.values,
+                    colLabels=stats_df.columns,
+                    cellLoc='center',
+                    loc='center',
+                    bbox=[0, 0, 1, 1]
+                )
+                
+                # Style the table
+                table.auto_set_font_size(False)
+                table.set_fontsize(8)
+                
+                # Set column widths
+                month_cols = ['Jan%', 'Feb%', 'Mar%', 'Apr%', 'May%', 'Jun%', 
+                            'Jul%', 'Aug%', 'Sep%', 'Oct%', 'Nov%', 'Dec%']
+                for (row, col), cell in table._cells.items():
+                    if col == 0:
+                        cell.set_width(0.05)
+                    elif stats_df.columns[col] in month_cols:
+                        cell.set_width(0.04)
+                    else:
+                        cell.set_width(0.08)
+                table.scale(2.5, 1.2)
+                
+                # Color header and alternating rows
+                for r in range(len(stats_df.index) + 1):
+                    for c in range(len(stats_df.columns)):
+                        cell = table._cells.get((r, c))
+                        if cell is not None:
+                            if r == 0:
+                                cell.set_facecolor('#ADD8E6')
+                            elif r % 2:
+                                cell.set_facecolor('#F0F0F0')
+                
+                plt.title(f"{strategies[i-7].replace('_', '-').title()} Monthly Statistics",
+                         pad=20, fontsize=12, fontweight='bold')
+            
+            elif i == 11:  # IC stats table
+                ax = plt.gca()
+                ax.axis('off')
+                
+                ic_stats = self.calculate_ic_stats()
+                if ic_stats is not None:
+                    table = ax.table(
+                        cellText=ic_stats.values,
+                        colLabels=ic_stats.columns,
+                        cellLoc='center',
+                        loc='center',
+                        bbox=[0, 0, 1, 1]
+                    )
+                    
+                    table.auto_set_font_size(False)
+                    table.set_fontsize(8)
+                    table.scale(2.5, 1.2)
+                    
+                    for (row, col), cell in table._cells.items():
+                        if row == 0:
+                            cell.set_facecolor('#ADD8E6')
+                        cell.set_height(0.2)
+                    
+                    plt.title('IC Statistics', pad=20)
+            
+            elif i == 12:  # Rank IC series
+                self.plot_rankic_series(plt.gca())
+            
+            elif i == 13:  # Cumulative IC
+                self.plot_cumulative_ic(plt.gca())
+            
+            elif i == 14:  # Turnover and metrics
+                gs = fig.add_gridspec(1, 2)
+                ax1 = fig.add_subplot(gs[0, 0])
+                ax2 = fig.add_subplot(gs[0, 1])
+                
+                self.plot_turnover(ax1)
+                
+                metrics = pd.DataFrame({
+                    'Annual Return (%)': self.annual_returns,
+                    'Sharpe Ratio': self.sharpe_ratios,
+                    'Max Drawdown (%)': self.max_drawdowns
+                }, index=[f'Group {i+1}' for i in range(self.group_num)])
+                metrics.plot(kind='bar', ax=ax2)
+                ax2.set_title('Performance Metrics by Group')
+                ax2.grid(True)
+            
+            # Adjust layout and save
+            plt.tight_layout()
+            pdf_path = os.path.join(output_dir, f'{row_name}.pdf')
+            fig.savefig(pdf_path, dpi=dpi, bbox_inches='tight')
+            plt.close(fig)
+            
+        print(f"PDF files have been saved to {output_dir}/")

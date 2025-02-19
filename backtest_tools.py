@@ -73,7 +73,7 @@ class CommissionModel:
 
 
 
-class InteractiveBrokersModel(CommissionModel):
+class BrokersModel(CommissionModel):
     def __init__(self, commission_per_share=0.005, min_commission=1.0, max_commission_pct=0.01):
         self.commission_per_share = commission_per_share
         self.min_commission = min_commission
@@ -156,6 +156,8 @@ class Trading:
         self.position_count = 0
 
         self.total_trade_value = 0
+        
+
 
         # Add logging parameters
         self.is_print = is_print
@@ -816,7 +818,7 @@ class Backtest:
                  distribution_data, factor_list, dir_='results', save_format='html',
                  stock_num=50, margin_rate=0.06, rebalance_freq='1d', 
                  rebalance_day=1, min_price=2.0, market_cap_percentile=0.05,
-                 buy_and_hold_list=None,gvkeyx='000003'):
+                 buy_and_hold_list=None,gvkeyx='000003', weight_change_threshold = 0.0):
         """
         Initialize backtest system with pre-loaded data
         
@@ -876,7 +878,7 @@ class Backtest:
         # Load benchmark and risk-free data
         self.gvkeyx = gvkeyx
         self._load_benchmark_data()
-
+        self.weight_change_threshold = weight_change_threshold
         trading_log_path = os.path.join(dir_, 'trading_logs.txt')
         # Initialize slippage model
         
@@ -1222,7 +1224,7 @@ class Backtest:
             weight_changes = {}
             for symbol in set(target_portfolio.keys()) & set(current_portfolio.keys()):
                 weight_diff = target_portfolio[symbol] - current_portfolio[symbol]
-                if abs(weight_diff) > 0.05:  # Small threshold to avoid tiny trades
+                if abs(weight_diff) > self.weight_change_threshold:  # Small threshold to avoid tiny trades
                     weight_changes[symbol] = weight_diff
 
             # 3. Execute sells for reducing positions
@@ -1294,7 +1296,7 @@ class Backtest:
             # Calculate turnover with more robust method
             # Turnover = (Total Buy + Total Sell) / Portfolio Value
             turnover = (
-                100 * self.trading.total_trade_value / portfolio_value
+                100 * self.trading.total_trade_value /2 / portfolio_value
             ) if portfolio_value > 0 else 0
             
             # Reset total trade value after calculating turnover
@@ -1700,14 +1702,34 @@ class Backtest:
         return fig
 
     def plot_drawdown(self, ax=None, interactive=True):
-        """Plot drawdown analysis with interactive features"""
+        """
+        Plot drawdown analysis with interactive features, including excess return drawdowns
+        and maximum drawdown markers for all series.
+        """
         if ax is None:
             fig, ax = plt.subplots(figsize=(12, 8))
 
+        # Calculate excess return drawdown
+        excess_returns = np.array(self.processed_data['portfolio_returns']) - np.array(self.processed_data['benchmark_returns'])
+        cum_excess = np.cumprod(1 + excess_returns)
+        excess_peak = np.maximum.accumulate(cum_excess)
+        excess_drawdown = (cum_excess - excess_peak) / excess_peak * 100
+
+        # Calculate maximum drawdowns
+        portfolio_mdd = np.min(self.processed_data['portfolio_drawdown'])
+        benchmark_mdd = np.min(self.processed_data['benchmark_drawdown'])
+        excess_mdd = np.min(excess_drawdown)
+
+        # Find maximum drawdown periods
+        portfolio_mdd_idx = np.argmin(self.processed_data['portfolio_drawdown'])
+        benchmark_mdd_idx = np.argmin(self.processed_data['benchmark_drawdown'])
+        excess_mdd_idx = np.argmin(excess_drawdown)
+
+        # Plot lines
         portfolio_line = ax.plot(
             self.processed_data['dates'],
             self.processed_data['portfolio_drawdown'],
-            label=f'Portfolio (Max DD: {self.metrics["Maximum Drawdown (%)"]:.1f}%)',
+            label=f'Portfolio (Max DD: {portfolio_mdd:.1f}%)',
             color='blue',
             linewidth=2
         )[0]
@@ -1715,11 +1737,28 @@ class Backtest:
         benchmark_line = ax.plot(
             self.processed_data['dates'],
             self.processed_data['benchmark_drawdown'],
-            label='Benchmark',
+            label=f'Benchmark (Max DD: {benchmark_mdd:.1f}%)',
             color='red',
             linestyle='--',
             linewidth=1.5
         )[0]
+
+        excess_line = ax.plot(
+            self.processed_data['dates'],
+            excess_drawdown,
+            label=f'Excess (Max DD: {excess_mdd:.1f}%)',
+            color='green',
+            linestyle=':',
+            linewidth=1.5
+        )[0]
+
+        # Mark maximum drawdown points
+        ax.scatter(self.processed_data['dates'][portfolio_mdd_idx], portfolio_mdd,
+                color='blue', s=100, zorder=5, alpha=0.6)
+        ax.scatter(self.processed_data['dates'][benchmark_mdd_idx], benchmark_mdd,
+                color='red', s=100, zorder=5, alpha=0.6)
+        ax.scatter(self.processed_data['dates'][excess_mdd_idx], excess_mdd,
+                color='green', s=100, zorder=5, alpha=0.6)
 
         ax.set_title('Drawdown Analysis', fontsize=12, pad=10)
         ax.set_xlabel('Date', fontsize=10)
@@ -1728,7 +1767,7 @@ class Backtest:
         ax.legend(fontsize=10)
 
         if interactive:
-            cursor = mplcursors.cursor([portfolio_line, benchmark_line], hover=True)
+            cursor = mplcursors.cursor([portfolio_line, benchmark_line, excess_line], hover=True)
             
             @cursor.connect("add")
             def on_hover(sel):
@@ -1738,6 +1777,16 @@ class Backtest:
                 
                 if sel.artist == portfolio_line:
                     recovery_days = 0
+                    peak_value = 0
+                    
+                    # Calculate drawdown length by counting consecutive negative days up to current point
+                    drawdown_length = 0
+                    for i in range(date_idx, -1, -1):
+                        if self.processed_data['portfolio_drawdown'][i] >= 0:
+                            break
+                        drawdown_length += 1
+                    
+                    # Calculate days to recovery
                     for i in range(date_idx, len(self.processed_data['portfolio_drawdown'])):
                         if self.processed_data['portfolio_drawdown'][i] >= 0:
                             break
@@ -1746,29 +1795,43 @@ class Backtest:
                     sel.annotation.set_text(
                         f"Portfolio Drawdown\nDate: {date_str}\n"
                         f"Drawdown: {y:.2f}%\n"
+                        f"Length: {drawdown_length} days\n"
                         f"Days to Recovery: {recovery_days if y < 0 else 0}"
                     )
-                else:
+                elif sel.artist == benchmark_line:
+                    drawdown_length = sum(1 for i in range(date_idx, -1, -1) 
+                                    if self.processed_data['benchmark_drawdown'][i] < 0)
                     sel.annotation.set_text(
                         f"Benchmark Drawdown\nDate: {date_str}\n"
-                        f"Drawdown: {y:.2f}%"
+                        f"Drawdown: {y:.2f}%\n"
+                        f"Length: {drawdown_length} days"
+                    )
+                else:  # Excess drawdown
+                    drawdown_length = sum(1 for i in range(date_idx, -1, -1) 
+                                    if excess_drawdown[i] < 0)
+                    sel.annotation.set_text(
+                        f"Excess Drawdown\nDate: {date_str}\n"
+                        f"Drawdown: {y:.2f}%\n"
+                        f"Length: {drawdown_length} days"
                     )
                 sel.annotation.get_bbox_patch().set(fc="white", alpha=0.8)
 
         return ax
 
     def plot_turnover(self, ax=None, interactive=True):
-        """Plot turnover analysis with interactive features"""
+        """Plot turnover analysis with interactive features using scatter plot"""
         if ax is None:
             fig, ax = plt.subplots(figsize=(12, 6))
 
-        turnover_line = ax.plot(
+        # Create scatter plot for turnover
+        turnover_scatter = ax.scatter(
             self.processed_data['dates'],
             self.processed_data['turnover'],
             color='blue',
-            label=f'Daily Turnover (Avg: {self.metrics["Avg Daily Turnover (%)"]:.1f}%)',
-            linewidth=1.5
-        )[0]
+            alpha=0.6,
+            s=30,  # Size of points
+            label=f'Daily Turnover (Avg: {self.metrics["Avg Daily Turnover (%)"]:.1f}%)'
+        )
 
         avg_turnover = self.metrics["Avg Daily Turnover (%)"]
         ax.axhline(
@@ -1786,7 +1849,7 @@ class Backtest:
         ax.legend(fontsize=10)
 
         if interactive:
-            cursor = mplcursors.cursor([turnover_line], hover=True)
+            cursor = mplcursors.cursor(turnover_scatter, hover=True)
             
             @cursor.connect("add")
             def on_hover(sel):
@@ -1811,5 +1874,101 @@ class Backtest:
 
         return ax
 
+    def save_performance_summary_pdfs(self, output_dir='performance_plots', dpi=600):
+        """
+        Save each row of the performance summary plot as a separate high-resolution PDF.
+        
+        Parameters:
+        -----------
+        output_dir : str
+            Directory where PDF files will be saved
+        dpi : int
+            Resolution of the output PDFs (default: 600 for high quality)
+        """
+        import os
+        from pathlib import Path
+        
+        # Create output directory if it doesn't exist
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Ensure metrics are calculated
+        if not hasattr(self, 'processed_data'):
+            self.calculate_performance_metrics()
+
+        # 1. Save Metrics Table
+        fig = plt.figure(figsize=(16, 4))
+        ax_summary = fig.add_subplot(111)
+        ax_summary.axis('off')
+        
+        metric_names = [
+            'Total\nReturn (%)', 'Annualized\nReturn (%)', 'Sharpe\nRatio', 
+            'Information\nRatio', 'Max\nDrawdown (%)', 'Benchmark Ann.\nReturn (%)',
+            'Std of Excess\nReturn (%)', 'Avg Daily\nTurnover (%)', 'Number of\nTrades'
+        ]
+        
+        metric_values = [
+            f"{self.metrics['Total Return (%)']:.2f}",
+            f"{self.metrics['Annualized Return (%)']:.2f}",
+            f"{self.metrics['Sharpe Ratio']:.2f}",
+            f"{self.metrics['Information Ratio']:.2f}",
+            f"{self.metrics['Maximum Drawdown (%)']:.2f}",
+            f"{self.metrics['Benchmark Annualized Return (%)']:.2f}",
+            f"{self.metrics['Std of Excess Return (%)']:.2f}",
+            f"{self.metrics['Avg Daily Turnover (%)']:.2f}",
+            f"{self.metrics['Number of Trades']:.0f}"
+        ]
+        
+        table = ax_summary.table(
+            cellText=[metric_values],
+            cellLoc='center',
+            colLabels=metric_names,
+            bbox=[0.05, 0.2, 0.9, 0.6]
+        )
+        
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1.2, 1.8)
+        
+        for (row, col), cell in table._cells.items():
+            cell.set_edgecolor('white')
+            if row == 0:
+                cell.set_facecolor('#E6F3FF')
+                cell.set_height(0.15)
+            else:
+                cell.set_facecolor('#F5F5F5')
+        
+        plt.savefig(os.path.join(output_dir, '1_metrics_table.pdf'), 
+                    dpi=dpi, bbox_inches='tight')
+        plt.close()
+
+        # 2. Save Cumulative Returns Plot
+        fig = plt.figure(figsize=(16, 8))
+        ax = fig.add_subplot(111)
+        self.plot_cumulative_returns(ax=ax, interactive=False)
+        plt.savefig(os.path.join(output_dir, '2_cumulative_returns.pdf'), 
+                    dpi=dpi, bbox_inches='tight')
+        plt.close()
+
+        # 3. Save Drawdown Plot
+        fig = plt.figure(figsize=(16, 8))
+        ax = fig.add_subplot(111)
+        self.plot_drawdown(ax=ax, interactive=False)
+        plt.savefig(os.path.join(output_dir, '3_drawdown_analysis.pdf'), 
+                    dpi=dpi, bbox_inches='tight')
+        plt.close()
+
+        # 4. Save Turnover Plot
+        fig = plt.figure(figsize=(16, 8))
+        ax = fig.add_subplot(111)
+        self.plot_turnover(ax=ax, interactive=False)
+        plt.savefig(os.path.join(output_dir, '4_turnover_analysis.pdf'), 
+                    dpi=dpi, bbox_inches='tight')
+        plt.close()
+
+        print(f"PDF files have been saved to {output_dir}/:")
+        print("├── 1_metrics_table.pdf")
+        print("├── 2_cumulative_returns.pdf")
+        print("├── 3_drawdown_analysis.pdf")
+        print("└── 4_turnover_analysis.pdf")
 
     
