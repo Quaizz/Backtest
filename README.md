@@ -4,6 +4,28 @@
 
 We aims to be an open-source framework for conducting rigorous daily-level stock backtesting. This framework bridges that gap by enabling accurate, daily-level backtesting using high-quality WRDS data.
 
+## Workflow
+
+To run this engine, here is the workflow
+
+Step 1: Data Import
+We start by running a notebook (e.g., create_dsf_v2.ipynb) that pulls raw financial data from an online source (using the WRDS Python API) and saves it into our local database (DuckDB). 
+
+Step 2: Define Your Factor
+Next, you open a Python file (FactorCalculator.py) where you write a custom SQL query. This query calculates a “factor” (e.g. ROE，PB ratio) that will be used later in the analysis. 
+
+Step 3: Calculate Daily Factor Data
+Then, you run another notebook (create_factor_parquet.ipynb) that applies your custom factor calculation to generate daily data. For example, if your factor is ROE, you’ll end up with a daily snapshot of ROE values across different companies. 
+
+Step 4: Factor Analysis
+After that, you analyze the computed factor by grouping the data (using factor_analysis.ipynb). You can find  more results from the slides
+
+Step 5: Backtest the Trading Strategy
+Finally, you run a notebook (backtest_portfolio.ipynb) that simulates a trading strategy based on your factor. This backtesting step includes realistic details like taxes, commissions, slippage, and other market factors. You can also find more results from the slides
+
+
+
+
 ### Why Daily Backtesting?
 
 While monthly backtesting dominates academic literature and many open-source implementations, we believe this approach doesn't adequately reflect real-world trading practices. Here's why daily backtesting matters:
