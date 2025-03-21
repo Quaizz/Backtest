@@ -14,7 +14,8 @@ import calendar
 
 class USQuantileFactorAnalysis:
     def __init__(self, data_df_dic,  factor_list, universe, 
-                 group_num, trading_date, rebalance_freq, balance_day, ic_periods, gvkeyx='000003',factor_ascending=False):
+                 group_num, trading_date, rebalance_freq, balance_day, ic_periods, gvkeyx='000003',factor_ascending=False, 
+                 min_price=2.0, market_cap_percentile=0.5):
         """
         Initialize factor analysis using daily return data directly.
         
@@ -73,6 +74,10 @@ class USQuantileFactorAnalysis:
         self.universe_cum = None
 
         self.factor_ascending = factor_ascending
+
+        self.min_price = min_price
+        self.market_cap_percentile = market_cap_percentile
+
 
         # Initialize IC lists
         self.ic_list = []
@@ -215,11 +220,11 @@ class USQuantileFactorAnalysis:
         prev_data_df = self.data_df_dic[prev_date]
 
         # Calculate market cap percentile threshold (e.g., bottom 5%)
-        mktcap_threshold = prev_data_df['dlycap'].quantile(0.05)
+        #mktcap_threshold = prev_data_df['dlycap'].quantile(self.market_cap_percentile)
         # Apply filters for investable universe
         factor_df = prev_data_df[
-            (prev_data_df['dlycap'] > mktcap_threshold) &  # Market cap > $500M
-            (prev_data_df['dlyprc'] > 2)      # Price > $5
+            (prev_data_df['dlycap'] > prev_data_df['dlycap'].quantile(self.market_cap_percentile)) &  # Market cap > $500M
+            (prev_data_df['dlyprc'] > self.min_price)      # Price > $5
         ]
         
         factor_df.dropna(subset=self.factor_list)
@@ -337,12 +342,13 @@ class USQuantileFactorAnalysis:
         prev_data_df = self.data_df_dic[prev_date]
         
         # Calculate market cap percentile threshold (e.g., bottom 5%)
-        mktcap_threshold = prev_data_df['dlycap'].quantile(0.05)
+        
         # Apply filters for investable universe
         
+
         factor_df = prev_data_df[
-            (prev_data_df['dlycap'] > mktcap_threshold) &  # Market cap > $500M
-            (prev_data_df['dlyprc'] > 2)      # Price > $5
+            (prev_data_df['dlycap'] > prev_data_df['dlycap'].quantile(self.market_cap_percentile)) &  # Market cap > $500M
+            (prev_data_df['dlyprc'] > self.min_price)      # Price > $5
         ]
         
         factor_df.dropna(subset=self.factor_list[0])

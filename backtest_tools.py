@@ -802,7 +802,7 @@ class Trading:
         rate = tax_rates.get(tax_type, 0.40 if is_short_term else 0.25)  # Default based on term
         #self.logger(f"Applied tax rate: {rate*100:.1f}% ({'Short-term' if is_short_term else 'Long-term'})")
         
-        return rate
+        return 0.0
     
     def get_total_position_value(self):
         """Calculate total value of current positions"""
@@ -818,7 +818,7 @@ class Backtest:
                  distribution_data, factor_list, dir_='results', save_format='html',
                  stock_num=50, margin_rate=0.06, rebalance_freq='1d', 
                  rebalance_day=1, min_price=2.0, market_cap_percentile=0.05,
-                 buy_and_hold_list=None,gvkeyx='000003', weight_change_threshold = 0.0):
+                 buy_and_hold_list=None,gvkeyx='000003', weight_change_threshold = 0.0, strategy=None):
         """
         Initialize backtest system with pre-loaded data
         
@@ -902,7 +902,9 @@ class Backtest:
 
         # Store buy and hold portfolio if provided
         self.buy_and_hold_list = buy_and_hold_list
-        
+        self.strategy = strategy
+
+
         if buy_and_hold_list is not None:
             self.logger(f"Using buy and hold strategy with {len(buy_and_hold_list)} stocks")
             # Verify weights sum to approximately 1
@@ -926,15 +928,17 @@ class Backtest:
         """Get rebalancing dates based on frequency"""
         if self.rebalance_freq == '1d':
             return self.trading_dates
-            
+        
+        # If not daily rebalancing, convert dates to DataFrame
         dates_df = pd.DataFrame({
             'date': pd.to_datetime(self.trading_dates)
         })
         
         if self.rebalance_freq == '1w':
             mask = dates_df['date'].dt.weekday == self.rebalance_day
-            return dates_df[mask]['date'].dt.strftime('%Y-%m-%d').tolist()
-            
+            # Return datetime objects to match the format expected elsewhere
+            return dates_df[mask]['date'].tolist()
+        
         elif self.rebalance_freq == '1m':
             dates_df['ym'] = dates_df['date'].dt.strftime('%Y%m')
             monthly_groups = dates_df.groupby('ym')
@@ -946,11 +950,15 @@ class Backtest:
                 valid_dates = group[group['date'].dt.day <= target_day]
                 
                 if not valid_dates.empty:
-                    rebalance_dates.append(valid_dates.iloc[-1]['date'].strftime('%Y-%m-%d'))
+                    rebalance_dates.append(valid_dates.iloc[-1]['date'])
                 else:
-                    rebalance_dates.append(group.iloc[0]['date'].strftime('%Y-%m-%d'))
-                    
+                    rebalance_dates.append(group.iloc[0]['date'])
+            
+            # Return datetime objects to match the format expected elsewhere
             return rebalance_dates
+        
+        # Fall back to daily rebalancing if frequency not recognized
+        return self.trading_dates
         
     def _load_benchmark_data(self):
         """
@@ -1001,13 +1009,13 @@ class Backtest:
             
             # Generate new portfolio targets on rebalance dates
             if date in self.rebalance_dates:
-                return self.generate_portfolio_targets(prev_data_df)
+                return self.generate_portfolio_targets(date, prev_data_df)
             return {}
         except Exception as e:
             self.logger(f"Error in before_market_open for {date}: {str(e)}")
             return {}
     
-    def generate_portfolio_targets(self, data_df):
+    def generate_portfolio_targets(self, date, data_df):
         """
         Generate target portfolio based on factor values
         
@@ -1021,7 +1029,26 @@ class Backtest:
         dict : {symbol: target_weight}
         """
         try:
+            # If external strategy is provided, delegate to it
+            if self.strategy is not None:
+                # Check if the strategy has the expected method
+                if hasattr(self.strategy, 'generate_portfolio_targets'):
 
+                    
+                    return self.strategy.generate_portfolio_targets(
+                        date,
+                        data_df, 
+                        min_price=self.min_price,
+                        market_cap_percentile=self.market_cap_percentile,
+                        stock_num=self.stock_num,
+                        logger=self.logger
+                    )
+
+                    
+                else:
+                    self.logger("Error: Strategy object does not implement generate_portfolio_targets method")
+                    return {}
+                
             # If buy and hold list is provided, use it
             if self.buy_and_hold_list is not None:
                 # Only return stocks that exist in current universe
@@ -1160,124 +1187,120 @@ class Backtest:
 
     def market_open(self, target_portfolio, current_date, current_data_df ):
         """Execute trades to achieve target portfolio"""
-        try:
-            if not target_portfolio:
-                return
-                
-            #price_df = self.data_df_dic[current_date]
-            price_df = self.trading.update_prices(current_date, current_data_df, timing='open')
-
-            current_value = self.trading.get_portfolio_value()
+        
+        if not target_portfolio:
+            return
             
-            # Filter out delisted stocks from target portfolio
-            delisted_symbols = [
-                symbol for symbol in target_portfolio.keys()
-                if symbol in price_df.index and price_df.loc[symbol, 'dlydelflg'] == 'Y'
-            ]
-            for symbol in delisted_symbols:
-                if symbol in target_portfolio:
-                    self.logger(f"Removing delisted stock {symbol} from target portfolio")
-                    del target_portfolio[symbol]
+        #price_df = self.data_df_dic[current_date]
+        price_df = self.trading.update_prices(current_date, current_data_df, timing='open')
+
+        current_value = self.trading.get_portfolio_value()
+        
+        # Filter out delisted stocks from target portfolio
+        delisted_symbols = [
+            symbol for symbol in target_portfolio.keys()
+            if symbol in price_df.index and price_df.loc[symbol, 'dlydelflg'] == 'Y'
+        ]
+        for symbol in delisted_symbols:
+            if symbol in target_portfolio:
+                self.logger(f"Removing delisted stock {symbol} from target portfolio")
+                del target_portfolio[symbol]
 
 
-            # Calculate current weights
-            current_portfolio = {
-                symbol: (pos[1] * pos[2] / current_value)
-                for symbol, pos in self.trading.positions.items()
-            }
-            #print(current_portfolio)
-            # Track trade details
-            trade_details = {
-                'buy_value': 0,
-                'sell_value': 0,
-                'trade_attempts': 0,
-                'successful_trades': 0
-            }
-            
-            # First handle sells for stocks not in price data
-            for symbol in current_portfolio.keys():
-                if symbol not in price_df.index:
-                    self.logger(f"Warning: Symbol {symbol} not found in price data - forcing sell")
-                    if symbol in self.trading.last_valid_prices:
-                        price = self.trading.last_valid_prices[symbol]
-                        shares = self.trading.positions[symbol][1]  # Sell all shares
-                        
-                        if self.trading.order_sell(current_date, symbol, shares, price):
-                            trade_details['successful_trades'] += 1
-                            trade_details['sell_value'] += shares * price
-                            self.logger(f"Forced sell of {symbol}: {shares} shares at ${price:.2f}")
-
-            # 1. Sell positions that are not in target portfolio
-            for symbol in list(current_portfolio.keys()):
-                if symbol not in target_portfolio:
-                    if symbol in self.trading.positions:
-                        shares = self.trading.positions[symbol][1]
+        # Calculate current weights
+        current_portfolio = {
+            symbol: (pos[1] * pos[2] / current_value)
+            for symbol, pos in self.trading.positions.items()
+        }
+        #print(current_portfolio)
+        # Track trade details
+        trade_details = {
+            'buy_value': 0,
+            'sell_value': 0,
+            'trade_attempts': 0,
+            'successful_trades': 0
+        }
+        
+        # 1. Sell positions that are not in target portfolio
+        for symbol in list(current_portfolio.keys()):
+            if symbol not in target_portfolio:
+                if symbol in self.trading.positions:
+                    shares = self.trading.positions[symbol][1]
+                    
+                    # Check if symbol is in price_df
+                    if symbol in price_df.index:
                         price = price_df.loc[symbol, 'dlyopen']
-                        
-                        self.logger(f"Liquidating position in {symbol}: {shares} shares")
-                        if self.trading.order_sell(current_date, symbol, shares, price):
-                            trade_details['successful_trades'] += 1
-                            trade_details['sell_value'] += shares * price
-                        trade_details['trade_attempts'] += 1
+                        self.logger(f"Liquidating position in {symbol}: {shares} shares at price ${price:.2f}")
+                    else:
+                        # Use last valid price if not in current price data
+                        if symbol in self.trading.last_valid_prices:
+                            price = self.trading.last_valid_prices[symbol]
+                            self.logger(f"Liquidating position in {symbol} using last valid price: {shares} shares at ${price:.2f}")
+                        else:
+                            self.logger(f"Cannot liquidate {symbol} - no valid price available")
+                            continue
+                    
+                    if self.trading.order_sell(current_date, symbol, shares, price):
+                        trade_details['successful_trades'] += 1
+                        trade_details['sell_value'] += shares * price
+                    trade_details['trade_attempts'] += 1
 
-            # 2. Calculate weight changes for existing positions
-            weight_changes = {}
-            for symbol in set(target_portfolio.keys()) & set(current_portfolio.keys()):
-                weight_diff = target_portfolio[symbol] - current_portfolio[symbol]
-                if abs(weight_diff) > self.weight_change_threshold:  # Small threshold to avoid tiny trades
-                    weight_changes[symbol] = weight_diff
+        # 2. Calculate weight changes for existing positions
+        weight_changes = {}
+        for symbol in set(target_portfolio.keys()) & set(current_portfolio.keys()):
+            weight_diff = target_portfolio[symbol] - current_portfolio[symbol]
+            if abs(weight_diff) > self.weight_change_threshold:  # Small threshold to avoid tiny trades
+                weight_changes[symbol] = weight_diff
 
-            # 3. Execute sells for reducing positions
-            for symbol, weight_diff in weight_changes.items():
-                if weight_diff < 0:
-                    shares = self.calculate_shares_from_weight(abs(weight_diff), symbol, price_df)
-                    if shares > 0:
-                        price = price_df.loc[symbol, 'dlyopen']
-                        trade_details['trade_attempts'] += 1
-                        if self.trading.order_sell(current_date, symbol, shares, price):
-                            trade_details['successful_trades'] += 1
-                            trade_details['sell_value'] += shares * price
+        # 3. Execute sells for reducing positions
+        for symbol, weight_diff in weight_changes.items():
+            if weight_diff < 0:
+                shares = self.calculate_shares_from_weight(abs(weight_diff), symbol, price_df)
+                if shares > 0:
+                    price = price_df.loc[symbol, 'dlyopen']
+                    trade_details['trade_attempts'] += 1
+                    if self.trading.order_sell(current_date, symbol, shares, price):
+                        trade_details['successful_trades'] += 1
+                        trade_details['sell_value'] += shares * price
 
-            # 4. Execute buys for increasing positions
-            for symbol, weight_diff in weight_changes.items():
-                if weight_diff > 0:
-                    shares = self.calculate_shares_from_weight(weight_diff, symbol, price_df)
-                    if shares > 0:
-                        price = price_df.loc[symbol, 'dlyopen']
-                        trade_details['trade_attempts'] += 1
-                        if self.trading.order_buy(current_date, symbol, shares, price):
-                            trade_details['successful_trades'] += 1
-                            trade_details['buy_value'] += shares * price
+        # 4. Execute buys for increasing positions
+        for symbol, weight_diff in weight_changes.items():
+            if weight_diff > 0:
+                shares = self.calculate_shares_from_weight(weight_diff, symbol, price_df)
+                if shares > 0:
+                    price = price_df.loc[symbol, 'dlyopen']
+                    trade_details['trade_attempts'] += 1
+                    if self.trading.order_buy(current_date, symbol, shares, price):
+                        trade_details['successful_trades'] += 1
+                        trade_details['buy_value'] += shares * price
 
-            # 5. Buy new positions
-            for symbol in set(target_portfolio.keys()) - set(current_portfolio.keys()):
-                if not price_df.loc[symbol, 'tradingstatusflg'] in ['H', 'S']:  # Skip suspended stocks
-                    shares = self.calculate_shares_from_weight(target_portfolio[symbol], symbol, price_df)
-                    if shares > 0:
-                        price = price_df.loc[symbol, 'dlyopen']
-                        trade_details['trade_attempts'] += 1
-                        if self.trading.order_buy(current_date, symbol, shares, price):
-                            trade_details['successful_trades'] += 1
-                            trade_details['buy_value'] += shares * price
+        # 5. Buy new positions
+        for symbol in set(target_portfolio.keys()) - set(current_portfolio.keys()):
+            if not price_df.loc[symbol, 'tradingstatusflg'] in ['H', 'S']:  # Skip suspended stocks
+                shares = self.calculate_shares_from_weight(target_portfolio[symbol], symbol, price_df)
+                if shares > 0:
+                    price = price_df.loc[symbol, 'dlyopen']
+                    trade_details['trade_attempts'] += 1
+                    if self.trading.order_buy(current_date, symbol, shares, price):
+                        trade_details['successful_trades'] += 1
+                        trade_details['buy_value'] += shares * price
 
-            
-            # Print trade and position information using Trading class methods
-            self.trading.print_trading_info(current_date)
-            self.trading.print_position_info(current_date, price_df)
-            
-            # Update total trade value for turnover calculation
-            self.trading.total_trade_value += (trade_details['buy_value'] + trade_details['sell_value'])
-            # Store daily trade details
-            self.daily_trade_details[current_date] = trade_details
-            self.logger(f"\nDaily Trading Statistics:")
-            self.logger(f"  Trade Attempts: {trade_details['trade_attempts']}")
-            self.logger(f"  Successful Trades: {trade_details['successful_trades']}")
-            self.logger(f"  Buy Value: ${trade_details['buy_value']:,.2f}")
-            self.logger(f"  Sell Value: ${trade_details['sell_value']:,.2f}")
+        
+        # Print trade and position information using Trading class methods
+        self.trading.print_trading_info(current_date)
+        self.trading.print_position_info(current_date, price_df)
+        
+        # Update total trade value for turnover calculation
+        self.trading.total_trade_value += (trade_details['buy_value'] + trade_details['sell_value'])
+        # Store daily trade details
+        self.daily_trade_details[current_date] = trade_details
+        self.logger(f"\nDaily Trading Statistics:")
+        self.logger(f"  Trade Attempts: {trade_details['trade_attempts']}")
+        self.logger(f"  Successful Trades: {trade_details['successful_trades']}")
+        self.logger(f"  Buy Value: ${trade_details['buy_value']:,.2f}")
+        self.logger(f"  Sell Value: ${trade_details['sell_value']:,.2f}")
 
 
-        except Exception as e:
-            self.logger(f"Error in market_open for {current_date}: {str(e)}")
         
 
     def after_market_close(self, current_date, current_data_df):

@@ -9,7 +9,7 @@ from tqdm import tqdm
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import concurrent
-
+from FactorCalculator import FactorNeutralizer
 
 
 def get_all_investment_universe(date_str, duck_conn):
@@ -95,6 +95,151 @@ def process_factors(start_date, end_date, output_base_folder, factors):
                 print(f"Error processing date {date_str}: {str(e)}")
                 continue
 
+
+
+def process_neutralized_factors(start_date, end_date, input_base_folder, output_base_folder, 
+                               factor_names, neutralization_types=None):
+    """
+    Process existing factors and create neutralized versions.
+    
+    Args:
+        start_date (str): Start date in 'YYYY-MM-DD' format
+        end_date (str): End date in 'YYYY-MM-DD' format
+        input_base_folder (str): Base folder where original factors are stored
+        output_base_folder (str): Base folder for storing neutralized factor data
+        factor_names (list): List of factor names to neutralize
+        neutralization_types (list): List of neutralization types. Default is ['naics', 'size', 'combined']
+    """
+    if neutralization_types is None:
+        neutralization_types = ['naics', 'size', 'combined']
+    
+    with duckdb.connect('wrds_data.db', read_only=True) as duck_conn:
+        trading_dates = get_trading_dates(start_date, end_date, duck_conn)
+        print(f"Processing neutralized factors for {len(trading_dates)} trading dates")
+        
+        # Create neutralizer
+        neutralizer = FactorNeutralizer()
+        
+        # Create output folders
+        os.makedirs(output_base_folder, exist_ok=True)
+        
+        # Process each date
+        for date in tqdm(trading_dates, desc="Processing dates"):
+            date_str = date.strftime('%Y-%m-%d')
+            parquet_date_str = pd.to_datetime(date_str).strftime('%Y%m%d')
+            
+            #print(f"\nProcessing date: {date_str}")
+            
+            # Process each factor
+            for factor_name in factor_names:
+                try:
+                    # Load original factor data
+                    input_file = f"{input_base_folder}/{factor_name}/{factor_name}_{date_str}.parquet"
+                    if not os.path.exists(input_file):
+                        print(f"Factor file not found: {input_file}")
+                        continue
+                        
+                    # Load base data (contains NAICS and market cap)
+                    base_data_file = f"Data_all/Base_Data/{parquet_date_str}.parquet"
+                    
+                    if not os.path.exists(base_data_file):
+                        print(f"Base data file not found: {base_data_file}")
+                        continue
+                    
+                    # Load factor and base data
+                    factor_df = pd.read_parquet(input_file)
+                    base_df = pd.read_parquet(base_data_file)
+                    
+                    # Always use the last column as the factor value
+                    last_col = factor_df.columns[-1]
+                    
+                    # Create a copy with the factor column renamed to the expected name
+                    factor_df = factor_df.copy()
+                    factor_df[factor_name] = factor_df[last_col]
+                    
+                    # Merge to get NAICS and market cap data with factor data
+                    if 'permno' in factor_df.columns:
+                        merged_df = factor_df.merge(
+                            base_df[['naics', 'naics_sector', 'dlycap']], 
+                            left_on='permno', 
+                            right_index=True,
+                            how='left'
+                        )
+                    else:
+                        # Assuming factor_df is indexed by permno
+                        merged_df = factor_df.merge(
+                            base_df[['naics', 'naics_sector', 'dlycap']],
+                            left_index=True,
+                            right_index=True,
+                            how='left'
+                        )
+                    
+                    # Apply each type of neutralization
+                    for neut_type in neutralization_types:
+                        try:
+                            if neut_type == 'naics':
+                                neutralized_df = neutralizer.neutralize_by_naics(
+                                    merged_df, 
+                                    factor_name,
+                                    winsorize_factor=True,
+                                    standardize_factor=True
+                                )
+                                output_suffix = 'naics_neutral'
+                            elif neut_type == 'size':
+                                neutralized_df = neutralizer.neutralize_by_size(
+                                    merged_df, 
+                                    factor_name,
+                                    winsorize_factor=True,
+                                    standardize_factor=True
+                                )
+                                output_suffix = 'size_neutral'
+                            elif neut_type == 'combined':
+                                neutralized_df = neutralizer.neutralize_combined(
+                                    merged_df, 
+                                    factor_name,
+                                    winsorize_factor=True,
+                                    standardize_factor=True
+                                )
+                                output_suffix = 'neutral'
+                            else:
+                                print(f"Unknown neutralization type: {neut_type}")
+                                continue
+                            
+                            # Create output folder
+                            output_folder = f"{output_base_folder}/{factor_name}_{output_suffix}"
+                            os.makedirs(output_folder, exist_ok=True)
+                            
+                            # Prepare output file
+                            output_file = f"{output_folder}/{factor_name}_{output_suffix}_{date_str}.parquet"
+                            
+                            # Extract output column name
+                            output_col = f"{factor_name}_{output_suffix}"
+                            
+                            # Check if output column exists
+                            if output_col not in neutralized_df.columns:
+                                print(f"Output column '{output_col}' not found in neutralized dataframe")
+                                continue
+                            
+                            # Keep only necessary columns
+                            id_cols = ['permno', 'date', 'gvkey', 'iid', 'lpermno', 'lpermco']
+                            cols_to_keep = [col for col in id_cols if col in neutralized_df.columns]
+                            cols_to_keep.append(output_col)
+                            
+                            # Save neutralized factor
+                            neutralized_df[cols_to_keep].to_parquet(output_file)
+                            #print(f"Saved {output_suffix} {factor_name} to {output_file}")
+                        
+                        except Exception as e:
+                            import traceback
+                            print(f"Error with {neut_type} neutralization for {factor_name}: {str(e)}")
+                            print(traceback.format_exc())
+                            continue
+                    
+                except Exception as e:
+                    import traceback
+                    print(f"Error processing {factor_name} for {date_str}: {str(e)}")
+                    print(traceback.format_exc())
+                    continue
 
 
 def examine_factor_file(date_str, factor_name, base_folder="factor_data"):
@@ -256,7 +401,7 @@ def get_trading_dates(start_date, end_date, db_conn):
         trading_dates_query.format(start_date=start_date, end_date=end_date)
     ).fetchdf()['trading_date'].tolist()
 
-
+'''
 def sql_base_data(date, parquet_path,db_conn):
     """
     Load and cache basic market data for a single date.
@@ -306,63 +451,259 @@ def sql_base_data(date, parquet_path,db_conn):
         base_info_df.to_parquet(parquet_path.format(parquet_date))
     
     return base_info_df
-'''
-def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data_path):
-    """
-    Create dataset for factor analysis, following the efficient patterns
-    of the Chinese version but adapted for US market needs.
-    """
-    db_conn = duckdb.connect(db_path, read_only=True)
-    
-    try:
-        trading_dates = get_trading_dates(start_date, end_date, db_conn)
-        
-        cache_dir = os.path.join('Data_all', 'Base_Data')
-        parquet_path = os.path.join(cache_dir, '{}.parquet')
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        data_df_dic = {}
-        for date in trading_dates:
-            if os.path.exists(parquet_path.format(date)):
-                base_df = pd.read_parquet(parquet_path.format(date))
-            else:
-                base_df = sql_base_data(date, parquet_path,db_conn)
-            
-            factor_df = load_factor_data(date, factor_name, factor_data_path)
-            # Set 'permno' as index for factor DataFrame
-            factor_df.set_index('permno', inplace=True)
 
-            if factor_df is not None:
-                data_df_dic[date] = pd.concat([base_df, factor_df], axis=1)
-        
-        return data_df_dic, trading_dates
-        
-    finally:
-        db_conn.close()
 '''
-def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data_path):
+
+def sql_base_data(date, parquet_path, db_conn):
     """
-    Create dataset for factor analysis with parallel processing.
-    Loads all stocks without filtering to allow flexibility in backtesting.
+    Load and cache basic market data for a single date, including NAICS industry codes.
+    Uses dlycaldt as the date column which is specific to dsf_v2 table.
+    
+    Parameters:
+    -----------
+    date : str
+        Date in 'YYYY-MM-DD' format
+    parquet_path : str
+        Path template for saving parquet files
+    db_conn : duckdb.DuckDBPyConnection
+        Connection to the database
+        
+    Returns:
+    --------
+    DataFrame : Daily stock data with standardized formatting and NAICS industry codes
     """
+    # First, get the basic stock data
+    query = f"""
+        SELECT 
+            s.permno,
+            s.dlycaldt as date,
+            s.dlyprc,
+            s.dlyprevprc,
+            s.dlyret,
+            s.dlyretmissflg,
+            s.dlycap,
+            s.tradingstatusflg,
+            s.securitytype,
+            s.sharetype,
+            s.dlyclose,
+            s.dlyopen
+        FROM dsf_v2 s
+        WHERE s.dlycaldt = DATE '{date}'
+        ORDER BY s.dlycaldt
+    """
+    
+    # Execute query directly
+    base_info_df = db_conn.execute(query).fetchdf()
+    
+    # Now get NAICS data for all permnos
+    permnos = base_info_df['permno'].tolist()
+    
+    if permnos:
+        naics_query = f"""
+        WITH naics_data AS (
+            SELECT 
+                s.permno,
+                COALESCE(s.naics, '0') as naics,
+                CASE 
+                    WHEN s.naics IS NULL OR s.naics = '' THEN '0'
+                    ELSE SUBSTRING(s.naics, 1, 2) 
+                END as naics_sector,
+                s.secinfostartdt,
+                s.secinfoenddt
+            FROM stksecurityinfohist s
+            WHERE s.permno IN ({', '.join([str(p) for p in permnos])})
+            AND s.secinfostartdt <= DATE '{date}'
+            AND (s.secinfoenddt >= DATE '{date}' OR s.secinfoenddt IS NULL)
+        )
+        SELECT 
+            permno,
+            naics,
+            naics_sector
+        FROM naics_data
+        """
+        
+        try:
+            naics_df = db_conn.execute(naics_query).fetchdf()
+            
+            # Join the NAICS data to our base info
+            base_info_df = base_info_df.merge(
+                naics_df,
+                on='permno',
+                how='left'
+            )
+            
+            # Fill missing NAICS codes with '0'
+            base_info_df['naics'] = base_info_df['naics'].fillna('0')
+            base_info_df['naics_sector'] = base_info_df['naics_sector'].fillna('0')
+            
+        except Exception as e:
+            print(f"Error retrieving NAICS data: {str(e)}")
+            # Still continue with the base data
+            base_info_df['naics'] = '0'
+            base_info_df['naics_sector'] = '0'
+    
+    # Set index to permno
+    base_info_df.set_index('permno', inplace=True)
+    
+    # Convert date to YYYYMMDD format for parquet filename
+    parquet_date = pd.to_datetime(date).strftime('%Y%m%d')
+    
+    if len(base_info_df) > 0:
+        # Use the formatted date in the parquet path
+        base_info_df.to_parquet(parquet_path.format(parquet_date))
+    
+    return base_info_df
+
+
+def load_factor_data(date, factor_names, factor_data_path='factor_data'):
+    """
+    Load multiple factors' data from parquet files.
+    
+    Parameters:
+    -----------
+    date : str
+        Date in 'YYYY-MM-DD' format
+    factor_names : list
+        List of factor names
+    factor_data_path : str
+        Base directory for factor data
+        
+    Returns:
+    --------
+    DataFrame : Combined factor data for the date
+    """
+    date_formatted = pd.to_datetime(date).strftime('%Y-%m-%d')
+    
+    # Initialize with None
+    combined_df = None
+    
+    for factor_name in factor_names:
+        # Construct path for each factor
+        factor_file = Path(factor_data_path) / str(factor_name) / f"{factor_name}_{date_formatted}.parquet"
+        
+        if not factor_file.exists():
+            print(f"File not found: {factor_file}")
+            continue
+            
+        # Load the current factor data
+        curr_df = pd.read_parquet(factor_file)
+        
+        # Skip if permno column is missing
+        if 'permno' not in curr_df.columns:
+            print(f"Warning: permno column missing in {factor_name} data for {date_formatted}")
+            continue
+        
+        # For the first valid factor, use it as our base
+        if combined_df is None:
+            # Keep this DataFrame as is - with row numbers as index
+            combined_df = curr_df
+        else:
+            # For additional factors, keep only permno and the factor column
+            factor_cols = ['permno']
+            if factor_name in curr_df.columns:
+                factor_cols.append(factor_name)
+            
+            # Only keep essential columns
+            curr_df = curr_df[factor_cols]
+            
+            # Merge on permno column (not index)
+            combined_df = pd.merge(
+                combined_df,
+                curr_df,
+                on='permno',
+                how='outer'  # Include all stocks from both datasets
+            )
+    
+    return combined_df
+
+
+def sql_extended_base_data(date, parquet_path, db_conn):
+    """
+    Load and cache extended market data for backtesting.
+    Includes additional fields for corporate actions and trading.
+    
+    Parameters:
+    -----------
+    date : str
+        Date in 'YYYY-MM-DD' format
+    parquet_path : str
+        Path template for saving parquet files
+    db_conn : duckdb.DuckDBPyConnection
+        Database connection
+        
+    Returns:
+    --------
+    DataFrame : Extended daily stock data
+    """
+    query = f"""
+        SELECT 
+            s.permno,
+            s.ticker,
+            s.dlycaldt as date,
+            s.dlyprc,
+            s.dlyprevprc,
+            s.dlyret,
+            s.dlyretmissflg,
+            s.dlycap,
+            s.tradingstatusflg,
+            s.securitytype,
+            s.sharetype,
+            s.dlyclose,
+            s.dlyopen,
+            s.dlyprcflg,
+            s.dlyprevprcflg,
+            s.dlydelflg,
+            s.dlydistretflg,
+            s.dlyfacprc,
+            s.dlyclose,
+            s.dlyopen
+        FROM dsf_v2 s
+        WHERE s.dlycaldt = DATE '{date}'
+        ORDER BY s.dlycaldt
+    """
+    
+    # Execute query
+    extended_info_df = db_conn.execute(query).fetchdf()
+    
+    # Set index
+    extended_info_df.set_index('permno', inplace=True)
+    
+    # Convert date to YYYYMMDD format for parquet filename
+    parquet_date = pd.to_datetime(date).strftime('%Y%m%d')
+    
+    if len(extended_info_df) > 0:
+        # Save to extended data directory
+        extended_path = parquet_path.format(parquet_date)
+        
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(extended_path), exist_ok=True)
+        
+        # Save extended data
+        extended_info_df.to_parquet(extended_path)
+    
+    return extended_info_df
+
+def create_analysis_data(start_date, end_date, factor_names, db_path, factor_data_path):
+    """
+    Create dataset for factor analysis with multiple factors.
+    """
+    if isinstance(factor_names, str):
+        factor_names = [factor_names]  # Convert single factor to list
+        
     db_conn = duckdb.connect(db_path, read_only=True)
     
     try:
-        # Get previous trading date before start_date
+        # Get previous trading date
         prev_date_query = f"""
             SELECT MAX(caldt) as prev_date
             FROM metaexchangecalendar
             WHERE tradingflg = 'Y'
             And caldt < DATE '{start_date}'
         """
-
-        prev_start_date = db_conn.execute(
-            prev_date_query, 
-        ).fetchone()[0]
+        prev_start_date = db_conn.execute(prev_date_query).fetchone()[0]
         
         trading_dates = get_trading_dates(prev_start_date, end_date, db_conn)
-
-    
 
         cache_dir = os.path.join('Data_all', 'Base_Data')
         parquet_path = os.path.join(cache_dir, '{}.parquet')
@@ -370,31 +711,44 @@ def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data
 
         data_df_dic = {}
         
-        # Process each date sequentially with detailed logging
         for date in tqdm(trading_dates, desc="Processing dates"):
             try:
-                #print(f"\nProcessing date: {date}")
                 date_str = pd.to_datetime(date).strftime('%Y%m%d')
+                
+                # Load base data
                 if os.path.exists(parquet_path.format(date_str)):
-                    #print(f"Loading cached data for {date}")
-                    
-                    #print(parquet_path.format(date))
                     base_df = pd.read_parquet(parquet_path.format(date_str))
                 else:
-                    #print(f"Getting base data for {date}")
-                    
-                    #print(parquet_path.format(date))
                     base_df = sql_base_data(date, parquet_path, db_conn)
 
-                #print(f"Loading factor data for {date}")
-                factor_df = load_factor_data(date, factor_name, factor_data_path)
+                # Load all factors
+                factor_df = load_factor_data(date, factor_names, factor_data_path)
                 
-                if factor_df is not None:
-                    #print(f"Combining data for {date}")
-                    factor_df.set_index('permno', inplace=True)
-                    data_df_dic[date] = pd.concat([base_df, factor_df], axis=1)
+                if factor_df is not None and 'permno' in factor_df.columns:
+                    # Reset index on base_df to get permno as a column
+                    base_df_reset = base_df.reset_index()
+                    
+                    # Remove duplicate columns (except permno)
+                    duplicate_cols = base_df_reset.columns.intersection(factor_df.columns).difference(['permno'])
+                    if not duplicate_cols.empty:
+                        factor_df = factor_df.drop(columns=duplicate_cols)
+                    
+                    # Merge on permno column
+                    merged_df = pd.merge(
+                        base_df_reset,  # permno is now a column
+                        factor_df,      # already has permno as column
+                        on='permno',
+                        how='left'      # keep all stocks in base_df
+                    )
+                    
+                    # Set permno back as index
+                    merged_df.set_index('permno', inplace=True)
+                    
+                    # Store the properly merged dataframe
+                    data_df_dic[date] = merged_df
                 else:
-                    print(f"No factor data found for {date}")
+                    # If no factor data, just use the base data
+                    data_df_dic[date] = base_df
                         
             except Exception as e:
                 print(f"\nError processing date {date}: {str(e)}")
@@ -403,8 +757,6 @@ def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data
                 print(traceback.format_exc())
                 continue
 
-
-
         return data_df_dic, trading_dates
 
     finally:
@@ -412,37 +764,83 @@ def create_analysis_data(start_date, end_date, factor_name, db_path, factor_data
 
 
 
-
-def load_factor_data(date, factor_name, factor_data_path='factor_data'):
+def create_extended_analysis_data(start_date, end_date, factor_names, db_path, factor_data_path):
     """
-    Load pre-calculated factor data from parquet file.
-    
-    Parameters:
-    -----------
-    date : str
-        Date in 'YYYY-MM-DD' format
-    factor_name : str
-        Name of the factor
-    base_path : str
-        Base directory for factor data
-        
-    Returns:
-    --------
-    DataFrame : Factor data for the date
+    Create dataset for backtesting with extended data.
     """
-
-    # Convert date string to datetime and format it as YYYYMMDD
-    date_formatted = pd.to_datetime(date).strftime('%Y-%m-%d')
-
-    factor_file = Path(factor_data_path) / factor_name / f"{factor_name}_{date_formatted}.parquet"
-    
-    if not factor_file.exists():
-        print(f"File not found: {factor_file}")
-        return None
+    if isinstance(factor_names, str):
+        factor_names = [factor_names]
         
-    return pd.read_parquet(factor_file)
+    db_conn = duckdb.connect(db_path, read_only=True)
+    
+    try:
+        # Get previous trading date
+        prev_date_query = f"""
+            SELECT MAX(caldt) as prev_date
+            FROM metaexchangecalendar
+            WHERE tradingflg = 'Y'
+            And caldt < DATE '{start_date}'
+        """
+        prev_start_date = db_conn.execute(prev_date_query).fetchone()[0]
+        
+        trading_dates = get_trading_dates(prev_start_date, end_date, db_conn)
+
+        # Use Extended_Base_Data directory
+        cache_dir = os.path.join('Data_all', 'Extended_Base_Data')
+        parquet_path = os.path.join(cache_dir, '{}.parquet')
+        os.makedirs(cache_dir, exist_ok=True)
+
+        data_df_dic = {}
+        
+        for date in tqdm(trading_dates, desc="Processing dates"):
+            try:
+                date_str = pd.to_datetime(date).strftime('%Y%m%d')
+                
+                # Load extended base data
+                if os.path.exists(parquet_path.format(date_str)):
+                    base_df = pd.read_parquet(parquet_path.format(date_str))
+                else:
+                    base_df = sql_extended_base_data(date, parquet_path, db_conn)
+
+                # Load factors
+                factor_df = load_factor_data(date, factor_names, factor_data_path)
+                
+                if factor_df is not None:
+                    # The base_df has permno as index
+                    # First reset the index to make permno a column
+                    base_df_with_permno = base_df.reset_index()
+                    
+                    # Merge on permno column
+                    merged_df = pd.merge(
+                        base_df_with_permno,
+                        factor_df,
+                        on='permno',
+                        how='left'  # Keep all stocks in base_df
+                    )
+                    
+                    # Set permno back as index if needed
+                    merged_df.set_index('permno', inplace=True)
+                    
+                    # Store result
+                    data_df_dic[date] = merged_df
+                else:
+                    # Just store the base data
+                    data_df_dic[date] = base_df
+                        
+            except Exception as e:
+                print(f"\nError processing date {date}: {str(e)}")
+                print(f"Error type: {type(e)}")
+                import traceback
+                print(traceback.format_exc())
+                continue
+
+        return data_df_dic, trading_dates
+
+    finally:
+        db_conn.close()
 
 
+        
 
 def create_benchmark_data(db_conn, gvkeyx, start_date, end_date, output_path='Data_all/Benchmark_data'):
     """
