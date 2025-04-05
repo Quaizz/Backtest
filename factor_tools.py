@@ -10,6 +10,8 @@ import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import concurrent
 from FactorCalculator import FactorNeutralizer
+import concurrent.futures
+from pathlib import Path
 
 
 def get_all_investment_universe(date_str, duck_conn):
@@ -96,6 +98,104 @@ def process_factors(start_date, end_date, output_base_folder, factors):
                 continue
 
 
+
+'''
+def process_single_date(date, output_base_folder, factors, db_path='wrds_data.db'):
+    """
+    Process a single date for all factors.
+    
+    This function is designed to be called by a thread pool.
+    
+    Args:
+        date: The date to process
+        output_base_folder: Base folder for storing factor data
+        factors: List of FactorCalculator instances
+        db_path: Path to the DuckDB database
+    
+    Returns:
+        tuple: (date_str, status, message)
+    """
+    date_str = date.strftime('%Y-%m-%d')
+    
+    try:
+        # Create a new database connection for this thread
+        with duckdb.connect(db_path, read_only=True) as duck_conn:
+            # Get universe for this date
+            universe_df = get_all_investment_universe(date_str, duck_conn)
+            
+            # Calculate each factor
+            results = []
+            for factor_calculator in factors:
+                try:
+                    factor_df = factor_calculator.calculate(date_str, universe_df, duck_conn)
+                    
+                    # Save to parquet
+                    output_folder = factor_calculator.get_output_folder(output_base_folder)
+                    Path(output_folder).mkdir(parents=True, exist_ok=True)
+                    output_file = f"{output_folder}/{factor_calculator.factor_name}_{date_str}.parquet"
+                    factor_df.to_parquet(output_file)
+                    
+                    results.append((factor_calculator.factor_name, "success"))
+                except Exception as e:
+                    results.append((factor_calculator.factor_name, f"error: {str(e)}"))
+            
+            return date_str, "success", {"universe_size": len(universe_df), "factors": results}
+    except Exception as e:
+        return date_str, "error", str(e)
+
+def process_factors(start_date, end_date, output_base_folder, factors, max_workers=None):
+    """
+    Main processing function to calculate multiple factors over a date range using multi-threading.
+    
+    Args:
+        start_date (str): Start date in 'YYYY-MM-DD' format
+        end_date (str): End date in 'YYYY-MM-DD' format
+        output_base_folder (str): Base folder for storing factor data
+        factors (list): List of FactorCalculator instances
+        max_workers (int, optional): Maximum number of worker threads. If None, uses default from ThreadPoolExecutor.
+    """
+    # If max_workers is not specified, the default will be min(32, os.cpu_count() + 4)
+    if max_workers is None:
+        import os
+        max_workers = min(32, os.cpu_count() + 4)
+    
+    with duckdb.connect('wrds_data.db', read_only=True) as duck_conn:
+        trading_dates = get_trading_dates(start_date, end_date, duck_conn)
+        print(f"Processing {len(trading_dates)} trading dates using {max_workers} worker threads")
+    
+    # Create output base directory
+    Path(output_base_folder).mkdir(parents=True, exist_ok=True)
+    
+    # Use ThreadPoolExecutor to parallelize date processing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all date processing tasks
+        future_to_date = {
+            executor.submit(process_single_date, date, output_base_folder, factors): date 
+            for date in trading_dates
+        }
+        
+        # Process results as they complete
+        for future in tqdm(concurrent.futures.as_completed(future_to_date), total=len(trading_dates), desc="Processing dates"):
+            date = future_to_date[future]
+            date_str = date.strftime('%Y-%m-%d')
+            
+            try:
+                result = future.result()
+                status = result[1]
+                
+                if status == "success":
+                    universe_size = result[2]["universe_size"]
+                    print(f"\nDate {date_str}: Processed {universe_size} stocks successfully")
+                    
+                    # Optionally show detailed factor results
+                    # for factor_result in result[2]["factors"]:
+                    #     print(f"  - {factor_result[0]}: {factor_result[1]}")
+                else:
+                    print(f"\nError processing date {date_str}: {result[2]}")
+            
+            except Exception as e:
+                print(f"\nException while processing date {date_str}: {str(e)}")
+'''
 
 def process_neutralized_factors(start_date, end_date, input_base_folder, output_base_folder, 
                                factor_names, neutralization_types=None):

@@ -125,7 +125,7 @@ class USQuantileFactorAnalysis:
         
         # Get risk-free rates for our trading dates
         self.daily_rf_rates = rf_df.loc[trading_dates, 'rf']
-
+    '''
     def check_trade_day(self, trade_date_list, rebalance_freq, balance_day):
         """
         Determine rebalancing dates based on frequency and preferred day.
@@ -201,7 +201,96 @@ class USQuantileFactorAnalysis:
             rerebalance_dates = sorted(rerebalance_dates)
             
         return rerebalance_dates
+    '''
+    def check_trade_day(self, trade_date_list, rebalance_freq, balance_day):
+        """
+        Determine rebalancing dates based on frequency and preferred day.
         
+        Parameters:
+        -----------
+        trade_date_list : list
+            List of all trading dates
+        rebalance_freq : str
+            Rebalancing frequency ('1d', '1w', '1m')
+        balance_day : int
+            Target day for rebalancing (0-6 for weekly, 1-31 for monthly)
+            
+        Returns:
+        --------
+        list
+            List of dates when rebalancing should occur
+        """
+        # Always include the first trading date
+        first_date = trade_date_list[1]
+        
+        # For daily rebalancing, use all trading dates
+        if rebalance_freq == '1d':
+            return trade_date_list
+            
+        # Convert dates to pandas datetime for easier manipulation
+        dates_df = pd.DataFrame({
+            'date_str': trade_date_list,
+            'date': pd.to_datetime(trade_date_list)
+        })
+        
+        # Handle weekly rebalancing
+        if rebalance_freq == '1w':
+            # Adjust balance_day to match desired weekday
+            # (balance_day should be 0-4, where 0 is Monday)
+            target_weekday = balance_day % 7
+            
+            # First filter for dates that are >= first_date
+            first_date_dt = pd.to_datetime(first_date)
+            dates_df = dates_df[dates_df['date'] >= first_date_dt]
+            
+            # Find dates that match the target weekday
+            rebalance_mask = dates_df['date'].dt.weekday == target_weekday
+            rebalance_dates = dates_df[rebalance_mask]['date_str'].tolist()
+            
+            # Ensure first_date is included if it's not already
+            if first_date not in rebalance_dates:
+                rebalance_dates = [first_date] + rebalance_dates
+                
+            # Sort dates to ensure correct order
+            rebalance_dates.sort(key=lambda x: pd.to_datetime(x))
+            
+        # Handle monthly rebalancing
+        elif rebalance_freq == '1m':
+            # Group dates by year-month
+            dates_df['ym'] = dates_df['date'].dt.strftime('%Y%m')
+            monthly_groups = dates_df.groupby('ym')
+            
+            rebalance_dates = []
+            for _, group in monthly_groups:
+                group = group.sort_values('date')
+                
+                # Get the last possible trading day for this target day
+                target_day = min(balance_day, group['date'].iloc[-1].day)
+                valid_dates = group[group['date'].dt.day <= target_day]
+                
+                if not valid_dates.empty:
+                    # Get the last valid trading day before or on target day
+                    rebalance_dates.append(valid_dates.iloc[-1]['date_str'])
+                else:
+                    # If no valid dates before target day, use month's first trading day
+                    rebalance_dates.append(group.iloc[0]['date_str'])
+            
+            # Filter out dates before start date and sort
+            start_date = pd.to_datetime(first_date)
+            rebalance_dates = [date for date in rebalance_dates 
+                        if pd.to_datetime(date) >= start_date]
+            
+            # Ensure first_date is included and dates are properly ordered
+            if first_date not in rebalance_dates:
+                rebalance_dates = [first_date] + rebalance_dates
+            else:
+                rebalance_dates = sorted(rebalance_dates, key=lambda x: pd.to_datetime(x))
+                
+        else:
+            raise ValueError(f"Invalid rebalance frequency: {rebalance_freq}")
+            
+        return rebalance_dates
+
     def initialize_portfolio(self, start_date):
         """
         Initialize the portfolio using factor data from the previous trading date.
@@ -227,19 +316,42 @@ class USQuantileFactorAnalysis:
             (prev_data_df['dlyprc'] > self.min_price)      # Price > $5
         ]
         
-        factor_df.dropna(subset=self.factor_list)
+        # Drop rows for each factor individually
+        for factor in self.factor_list:
+            factor_df = factor_df.dropna(subset=[factor])
+
+        
 
         # Calculate initial factor values
         self.cal_factor_func(factor_df)
-        sort_ascending = self.factor_ascending
-        factor_df.sort_values(by='point1', ascending=sort_ascending, inplace=True)
+        
+        factor_df.sort_values(by='point1', ascending=False, inplace=True)
         
         # Initialize group positions
         total_stocks = len(factor_df)
+
+        # Key: factor name, Value: list of medians for each group
+    
+        self.group_median_factors = {}
+        for factor in self.factor_list:
+            self.group_median_factors[factor] = [[] for _ in range(self.group_num)]
+
         for group_i in range(self.group_num):
             start_idx = int(total_stocks * group_i / self.group_num)
             end_idx = int(total_stocks * (group_i + 1) / self.group_num)
             self.group_position_list[group_i] = factor_df.index[start_idx:end_idx].tolist()
+
+            # Store median factor value for this group
+            group_stocks = self.group_position_list[group_i]
+            
+            # Calculate and store median for each individual factor
+            for factor in self.factor_list:
+                if len(group_stocks) > 0:
+                    # Get raw factor value (not the rank)
+                    median_value = factor_df.loc[group_stocks, factor].median()
+                    self.group_median_factors[factor][group_i].append(median_value)
+                else:
+                    self.group_median_factors[factor][group_i].append(None)
             
         # Initialize other class members
         for group_i in range(self.group_num):
@@ -291,9 +403,19 @@ class USQuantileFactorAnalysis:
     def cal_factor_func(self, factor_df):
         """Calculate composite factor score from multiple factors"""
         # Rank each factor
+        # Validate that factor_ascending is a list with the correct length
+        assert isinstance(self.factor_ascending, list), "factor_ascending must be a list"
+        assert len(self.factor_ascending) == len(self.factor_list), "factor_ascending must have the same length as factor_list"
+        
+        # Rank each factor according to its specific sort order
         ranks = pd.DataFrame()
-        for factor in self.factor_list:
-            ranks[f"{factor}_rank"] = factor_df[factor].rank(ascending=self.factor_ascending)
+        for i, factor in enumerate(self.factor_list):
+            ascending = self.factor_ascending[i]
+            ranks[f"{factor}_rank"] = factor_df[factor].rank(
+                ascending=ascending, 
+                
+            )
+        
         
         # Calculate composite score (average of ranks)
         factor_df['point1'] = ranks.sum(axis=1)
@@ -351,12 +473,14 @@ class USQuantileFactorAnalysis:
             (prev_data_df['dlyprc'] > self.min_price)      # Price > $5
         ]
         
-        factor_df.dropna(subset=self.factor_list[0])
+        # Drop rows for each factor individually
+        for factor in self.factor_list:
+            factor_df = factor_df.dropna(subset=[factor])
 
         # Calculate factors and sort
         self.cal_factor_func(factor_df)
-        sort_ascending = self.factor_ascending
-        factor_df.sort_values(by='point1', ascending=sort_ascending, inplace=True)
+        
+        factor_df.sort_values(by='point1', ascending=False, inplace=True)
         
         # Calculate new group assignments
         total_stocks = len(factor_df)
@@ -373,6 +497,17 @@ class USQuantileFactorAnalysis:
             
             # Update positions
             self.group_position_list[group_i] = new_group_stocks
+
+            
+            
+            # Calculate and store median for each individual factor
+            for factor in self.factor_list:
+                if len(new_group_stocks) > 0:
+                    # Get raw factor value (not the rank)
+                    median_value = factor_df.loc[new_group_stocks, factor].median()
+                    self.group_median_factors[factor][group_i].append(median_value)
+                else:
+                    self.group_median_factors[factor][group_i].append(None)
 
         # Calculate IC metrics
         self.calculate_ic(factor_df, date)
@@ -1171,42 +1306,42 @@ class USQuantileFactorAnalysis:
         
         tableheight = num_years /8 
         # Create grid for plots, tables, and metrics (13 rows total)
-        gs = fig.add_gridspec(15, 2, height_ratios=[1, 1, 1, 1, 1, 1, 1, tableheight, tableheight, tableheight, tableheight, 0.35 ,1 ,1, 1])
+        gs = fig.add_gridspec(16, 1, height_ratios=[1, 1, 1, 1, 1, 1, 1, tableheight, tableheight, tableheight, tableheight, 0.35 ,1 ,1, 1, 1])
         
         if interactive:
             # First 7 plots remain the same (0-6)
-            ax1 = fig.add_subplot(gs[0, :])
+            ax1 = fig.add_subplot(gs[0])
             self.plot_cumulative_returns_interactive(ax1, show_benchmark=True)
             
-            ax2 = fig.add_subplot(gs[1, :])
+            ax2 = fig.add_subplot(gs[1])
             self.plot_excess_returns_interactive(ax2)
             
-            ax3 = fig.add_subplot(gs[2, :])
+            ax3 = fig.add_subplot(gs[2])
             self.plot_universe_excess_returns_interactive(ax3)
             
             plot_types = ['long_short', 'long_universe', 'short_universe', 'long_benchmark']
             for i, plot_type in enumerate(plot_types):
-                ax = fig.add_subplot(gs[3+i, :])
+                ax = fig.add_subplot(gs[3+i])
                 self.plot_strategy_analysis(plot_type, ax, interactive=True)
         else:
-            ax1 = fig.add_subplot(gs[0, :])
+            ax1 = fig.add_subplot(gs[0])
             self.plot_cumulative_returns(ax1, show_benchmark=True)
             
-            ax2 = fig.add_subplot(gs[1, :])
+            ax2 = fig.add_subplot(gs[1])
             self.plot_excess_returns(ax2)
             
-            ax3 = fig.add_subplot(gs[2, :])
+            ax3 = fig.add_subplot(gs[2])
             self.plot_universe_excess_returns(ax3)
             
             plot_types = ['long_short', 'long_universe', 'short_universe', 'long_benchmark']
             for i, plot_type in enumerate(plot_types):
-                ax = fig.add_subplot(gs[3+i, :])
+                ax = fig.add_subplot(gs[3+i])
                 self.plot_strategy_analysis(plot_type, ax, interactive=False)
         
         # Add strategy statistics tables (rows 7-10)
         strategies = ['long_short', 'long_universe', 'short_universe', 'long_benchmark']
         for i, strategy in enumerate(strategies):
-            ax_table = fig.add_subplot(gs[7+i, :])
+            ax_table = fig.add_subplot(gs[7+i])
             stats_df = self.calculate_monthly_stats(strategy)
 
             stats_df = stats_df.round(2)
@@ -1251,7 +1386,7 @@ class USQuantileFactorAnalysis:
                             cell.set_facecolor('#F0F0F0')  # Light gray
 
         # Add IC stats table
-        ax_ic_stats = fig.add_subplot(gs[11,:])
+        ax_ic_stats = fig.add_subplot(gs[11])
         ic_stats = self.calculate_ic_stats()
         if ic_stats is not None:
             ax_ic_stats.axis('off')
@@ -1276,13 +1411,13 @@ class USQuantileFactorAnalysis:
         
 
         # After the IC stats table and before the cumulative IC plot, add:
-        ax_rankic_series = fig.add_subplot(gs[12,:])
+        ax_rankic_series = fig.add_subplot(gs[12])
         if interactive:
             self.plot_rankic_series_interactive(ax_rankic_series)
         else:
             self.plot_rankic_series(ax_rankic_series)
 
-        ax_ic = fig.add_subplot(gs[13,:])
+        ax_ic = fig.add_subplot(gs[13])
         if interactive:
             # ... other interactive plots ...
             self.plot_cumulative_ic_interactive(ax_ic)
@@ -1291,18 +1426,13 @@ class USQuantileFactorAnalysis:
             self.plot_cumulative_ic(ax_ic)
         
         # Add turnover and metrics plots at the bottom (row 12)
-        ax_turnover = fig.add_subplot(gs[14, 0])
+        ax_turnover = fig.add_subplot(gs[14])
         self.plot_turnover(ax_turnover)
         
-        ax_metrics = fig.add_subplot(gs[14, 1])
-        metrics = pd.DataFrame({
-            'Annual Return (%)': self.annual_returns,
-            'Sharpe Ratio': self.sharpe_ratios,
-            'Max Drawdown (%)': self.max_drawdowns
-        }, index=[f'Group {i+1}' for i in range(self.group_num)])
-        metrics.plot(kind='bar', ax=ax_metrics)
-        ax_metrics.set_title('Performance Metrics by Group')
-        ax_metrics.grid(True)
+        ax_metrics = fig.add_subplot(gs[15])
+        self.plot_metrics_table(ax_metrics)
+
+
         
         # Adjust layout
         #fig.suptitle('Factor Performance Analysis', fontsize=16, y=0.95)
@@ -1492,6 +1622,167 @@ class USQuantileFactorAnalysis:
                 f"RankIC: {self.rankic_list[date_idx]:.3f}"
             )
             sel.annotation.get_bbox_patch().set(fc="white", alpha=0.8)
+        
+        return ax
+    
+    def plot_metrics_table(self, ax):
+        """
+        Create a table showing key group metrics instead of bar charts.
+        Uses a custom layout with row labels as the first column of data.
+        
+        Parameters:
+        -----------
+        ax : matplotlib.axes.Axes
+            The axes on which to draw the table
+        """
+        # Hide axis
+        ax.axis('off')
+        
+        # Calculate average portfolio size for each group
+        avg_portfolio_sizes = []
+        for group_i in range(self.group_num):
+            # Calculate average number of stocks in this group across rebalances
+            group_sizes = []
+            for positions in self.group_position_list:
+                if isinstance(positions, list):  # Make sure it's a list
+                    group_sizes.append(len(positions))
+            
+            avg_size = sum(group_sizes) / len(group_sizes) if group_sizes else 0
+            avg_portfolio_sizes.append(avg_size)
+        
+        # Get raw median factor values from stored data
+        median_factor_values = {}
+        if hasattr(self, 'group_median_factors'):
+            for factor in self.factor_list:
+                if factor in self.group_median_factors:
+                    factor_medians = []
+                    for group_i in range(self.group_num):
+                        group_values = [v for v in self.group_median_factors[factor][group_i] 
+                                    if v is not None and not np.isnan(v)]
+                        if group_values:
+                            avg_median = sum(group_values) / len(group_values)
+                            # Check if the value is very small (near zero but not exactly zero)
+                            if abs(avg_median) < 0.01 and avg_median != 0:
+                                # Use scientific notation for very small values
+                                factor_medians.append(f"{avg_median:.2e}")
+                            else:
+                                factor_medians.append(f"{avg_median:.3f}")
+                        else:
+                            factor_medians.append("N/A")
+                    median_factor_values[factor] = factor_medians
+        
+        # If we have no factor medians, create placeholders
+        if not median_factor_values:
+            for factor in self.factor_list:
+                median_factor_values[factor] = ["N/A"] * self.group_num
+        
+        # Prepare data for the table
+        metrics_rows = [
+            'CAGR - Annual Rebalance',
+            'Maximum DrawDown',
+            'Sharpe Ratio',
+            'Average Portfolio Size',
+        ]
+        
+        metrics_data = {
+            'CAGR - Annual Rebalance': [f"{r:.1f}%" for r in self.annual_returns],
+            'Maximum DrawDown': [f"{-d:.1f}%" for d in self.max_drawdowns],
+            'Sharpe Ratio': [f"{s:.2f}" for s in self.sharpe_ratios],
+            'Average Portfolio Size': [f"{int(s)}" for s in avg_portfolio_sizes],
+        }
+        
+        # Add median factor values for each factor
+        for factor in self.factor_list:
+            if factor in median_factor_values:
+                metrics_rows.append(f'Median {factor}')
+                metrics_data[f'Median {factor}'] = median_factor_values[factor]
+        
+        # Create quintile headers
+        headers = [f"{i+1}st" if i == 0 else 
+                f"{i+1}nd" if i == 1 else 
+                f"{i+1}rd" if i == 2 else 
+                f"{i+1}th" for i in range(self.group_num)]
+        
+        # Add Universe data if available
+        if hasattr(self, 'universe_ann_return') and hasattr(self, 'universe_sharpe'):
+            headers.append('Universe')
+            for key in metrics_data:
+                if key == 'CAGR - Annual Rebalance':
+                    metrics_data[key].append(f"{self.universe_ann_return:.1f}%")
+                elif key == 'Sharpe Ratio':
+                    metrics_data[key].append(f"{self.universe_sharpe:.2f}")
+                elif key == 'Maximum DrawDown':
+                    # Calculate universe max drawdown
+                    universe_cum = np.array(self.universe_cum)
+                    running_max = np.maximum.accumulate(universe_cum)
+                    universe_dd = np.min((universe_cum - running_max) / running_max) * 100
+                    metrics_data[key].append(f"{-universe_dd:.1f}%")
+                else:
+                    metrics_data[key].append('NA')
+        
+        # Create the header row with blank first cell (for row labels column)
+        header_row = [''] + headers
+        
+        # Create cell data with row labels in first column
+        cell_text = []
+        for row_label in metrics_rows:
+            row_data = [row_label] + metrics_data[row_label]
+            cell_text.append(row_data)
+        
+        # Get backtest period for the top-left cell
+        if len(self.trading_date) > 1:
+            start_date = pd.to_datetime(self.trading_date[1]).strftime('%Y-%m-%d')
+            end_date = pd.to_datetime(self.trading_date[-1]).strftime('%Y-%m-%d')
+            backtest_period = f"Backtest Period:\n{start_date} to {end_date}"
+            header_row[0] = backtest_period
+        
+        # Create table with the custom data (including row labels in first column)
+        table = ax.table(
+            cellText=cell_text,
+            colLabels=header_row,
+            cellLoc='center',
+            loc='center',
+            bbox=[0, 0, 1, 1]
+        )
+        
+        # Style the table
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        
+        # Set column widths - give more space to the row labels column
+        label_col_width = 0.25  # 25% of width for row labels
+        data_col_width = 0.75 / len(headers)  # Distribute remaining 75% among data columns
+        
+        # Set column widths
+        for i, width in enumerate([label_col_width] + [data_col_width] * len(headers)):
+            for j in range(len(metrics_rows) + 1):  # +1 for header row
+                if (j, i) in table._cells:
+                    table._cells[(j, i)].set_width(width)
+        
+        # Make the row labels left-aligned and bold
+        for i in range(1, len(metrics_rows) + 1):  # Skip header row
+            if (i, 0) in table._cells:  # Row label column
+                cell = table._cells[(i, 0)]
+                cell.get_text().set_horizontalalignment('left')
+                cell.get_text().set_weight('bold')
+                # Add a small padding
+                cell.PAD = 0.1
+        
+        # Format the top-left cell
+        if (0, 0) in table._cells:
+            backtest_cell = table._cells[(0, 0)]
+            backtest_cell.get_text().set_fontsize(9)
+            backtest_cell.get_text().set_weight('bold')
+        
+        # Color headers and alternating rows
+        for i in range(len(metrics_rows) + 1):  # Includes header row
+            for j in range(len(headers) + 1):  # Includes label column
+                if (i, j) in table._cells:
+                    cell = table._cells[(i, j)]
+                    if i == 0:  # Header row
+                        cell.set_facecolor('#ADD8E6')  # Light blue
+                    elif i % 2 == 1:  # Alternating rows
+                        cell.set_facecolor('#F0F0F0')  # Light gray
         
         return ax
     
