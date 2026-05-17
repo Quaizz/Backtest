@@ -865,6 +865,8 @@ class Backtest:
         # Initialize backtest logging
         self.txt_file = open(os.path.join(dir_, 'backtest_logs.txt'), 'w+')
 
+        self.barra_history = {}
+
 
         # Store strategy parameters
         self.stock_num = stock_num
@@ -1328,6 +1330,9 @@ class Backtest:
             
             # Store turnover
             self.turnover_dic[current_date] = turnover
+
+
+            self.calculate_barra_exposures(current_date, current_data_df)
             
             # Log daily summary with more context
             self.logger(f"End of Day Summary for {current_date}:")
@@ -1662,7 +1667,7 @@ class Backtest:
         fig = plt.figure(figsize=(16, 24))
         
         # Create grid with better proportions
-        gs = fig.add_gridspec(4, 1, height_ratios=[0.5, 1, 1, 1])
+        gs = fig.add_gridspec(5, 1, height_ratios=[0.5, 1, 1, 1, 1])
 
         # Performance Summary Table - Now wider and two rows
         ax_summary = fig.add_subplot(gs[0])
@@ -1720,6 +1725,12 @@ class Backtest:
         # Turnover Plot
         ax3 = fig.add_subplot(gs[3])
         self.plot_turnover(ax3, interactive=True)
+
+
+
+        ax4 = fig.add_subplot(gs[4])
+        self.plot_barra_exposures_summary(ax4, interactive=interactive)
+
 
         plt.tight_layout()
         return fig
@@ -1994,4 +2005,412 @@ class Backtest:
         print("├── 3_drawdown_analysis.pdf")
         print("└── 4_turnover_analysis.pdf")
 
-    
+    '''
+    def calculate_barra_exposures(self, date, current_data_df):
+        """
+        Calculate Barra factor exposures for the current portfolio with factor standardization
+        
+        Parameters:
+        -----------
+        date : str
+            Current date in 'YYYY-MM-DD' format
+        current_data_df : DataFrame
+            DataFrame containing current price data
+            
+        Returns:
+        --------
+        dict : Dictionary of factor exposures
+        """
+        try:
+            from scipy.stats import zscore
+            
+            date_str = date if isinstance(date, str) else date.strftime('%Y-%m-%d')
+            
+            # Base path for factor data
+            base_path = 'D:/database/factor_data'
+            
+            # Define raw factors as a simple list
+            raw_factor_list = [
+                'log_market_cap',
+                'cum_return_252d_offset_21d',
+                'cum_return_126d_offset_21d',
+                'book_to_price'
+            ]
+            
+            # Load raw factor data
+            factor_data = {}
+            
+            for factor_path in raw_factor_list:
+                factor_file = os.path.join(base_path, factor_path, f"{factor_path}_{date_str}.parquet")
+                
+                if os.path.exists(factor_file):
+                    try:
+                        df = pd.read_parquet(factor_file)
+                        
+                        # Get the factor values based on DataFrame structure
+                        if df.index.name == 'permno':
+                            factor_data[factor_path] = df.iloc[:, 0]
+                        elif 'permno' in df.columns:
+                            df = df.set_index('permno')
+                            factor_data[factor_path] = df.iloc[:, 0]
+                        else:
+                            self.logger(f"Warning: Unable to find permno in {factor_path} data")
+                            continue
+                            
+                        self.logger(f"Loaded {factor_path} factor data with {len(df)} stocks")
+                    except Exception as e:
+                        self.logger(f"Error loading {factor_path} factor: {str(e)}")
+                else:
+                    self.logger(f"Factor file not found: {factor_file}")
+            
+            # Standardize the factors
+            standardized_factors = {}
+            for factor_name, factor_series in factor_data.items():
+                try:
+                    # Convert to float and remove NaN values
+                    temp = factor_series.copy().apply(float).dropna()
+                    
+                    # Calculate median and MAD for outlier handling
+                    med = temp.median()
+                    mad = (abs(temp - temp.median())).median()
+                    
+                    # Winsorize extreme values
+                    temp[temp < (med - 3*mad)] = med - 3*mad
+                    temp[temp > (med + 3*mad)] = med + 3*mad
+                    
+                    # Apply zscore standardization
+                    standardized_factors[factor_name] = pd.Series(
+                        index=temp.index,
+                        data=zscore(temp)
+                    )
+                    
+                    self.logger(f"Standardized {factor_name} factor")
+                except Exception as e:
+                    self.logger(f"Error standardizing {factor_name}: {str(e)}")
+            
+            # Calculate portfolio weights
+            portfolio_value = self.trading.get_portfolio_value()
+            
+            # Skip if no positions or empty portfolio
+            if not self.trading.positions or portfolio_value <= 0:
+                self.logger("No positions or zero portfolio value, skipping Barra analysis")
+                return {}
+            
+            # Calculate portfolio weights
+            portfolio_weights = {}
+            for permno, position in self.trading.positions.items():
+                shares = position[1]
+                price = position[2]
+                position_value = shares * price
+                weight = position_value / portfolio_value
+                portfolio_weights[permno] = weight
+            
+            # Calculate standardized factor exposures
+            std_exposures = {}
+            exposure_coverage = {}
+            
+            for factor, std_series in standardized_factors.items():
+                std_exposures[factor] = 0.0
+                exposure_coverage[factor] = 0.0
+                
+                for permno, weight in portfolio_weights.items():
+                    if permno in std_series.index:
+                        factor_value = std_series[permno]
+                        
+                        # Skip NaN or infinite values
+                        if pd.notna(factor_value) and not np.isinf(factor_value):
+                            std_exposures[factor] += factor_value * weight
+                            exposure_coverage[factor] += weight
+            
+            # Calculate style factor exposures
+            style_exposures = {
+                'size': std_exposures.get('log_market_cap', 0.0),
+                'momentum': 0.5 * std_exposures.get('cum_return_252d_offset_21d', 0.0) + 
+                            0.5 * std_exposures.get('cum_return_126d_offset_21d', 0.0),
+                'value': std_exposures.get('book_to_price', 0.0)
+            }
+            
+            # Log style factor exposures
+            self.logger(f"\nBarra Style Factor Exposures for {date_str}:")
+            for style, exposure in style_exposures.items():
+                self.logger(f"  {style.upper()}: {exposure:.4f}")
+            
+            # Log standardized factor exposures
+            self.logger(f"\nStandardized Factor Exposures:")
+            for factor, exposure in std_exposures.items():
+                coverage_pct = exposure_coverage[factor] * 100
+                self.logger(f"  {factor}: {exposure:.4f} (Coverage: {coverage_pct:.2f}%)")
+            
+        
+            
+            # Store combined results
+            combined_exposures = {**style_exposures, **std_exposures}
+            self.barra_history[date_str] = combined_exposures
+            
+            return combined_exposures
+            
+        except Exception as e:
+            self.logger(f"Error calculating Barra exposures: {str(e)}")
+            import traceback
+            self.logger(traceback.format_exc())
+            return {}
+    ''' 
+
+    def calculate_barra_exposures(self, date, current_data_df):
+        """
+        Calculate Barra factor exposures for the current portfolio with factor standardization
+        
+        Parameters:
+        -----------
+        date : str
+            Current date in 'YYYY-MM-DD' format
+        current_data_df : DataFrame
+            DataFrame containing current price data
+            
+        Returns:
+        --------
+        dict : Dictionary of factor exposures
+        """
+        try:
+            from scipy.stats import zscore
+            
+            date_str = date if isinstance(date, str) else date.strftime('%Y-%m-%d')
+            self.logger(f"\nCalculating Barra Exposures for {date_str}")
+            
+            # Base path for factor data
+            base_path = 'D:/database/factor_data'
+            
+            # Define raw factors as a simple list
+            raw_factor_list = [
+                'log_market_cap',
+                'cum_return_252d_offset_21d',
+                'cum_return_126d_offset_21d',
+                'book_to_price'
+            ]
+            
+            # Load and merge factor data
+            merged_df = None
+            
+            for factor_path in raw_factor_list:
+                factor_file = os.path.join(base_path, factor_path, f"{factor_path}_{date_str}.parquet")
+                
+                if os.path.exists(factor_file):
+                    try:
+                        df = pd.read_parquet(factor_file)
+                        
+                        # The factor data is in the last column of the DataFrame
+                        factor_column = df.columns[-1]
+                        self.logger(f"Loading {factor_path} data from column '{factor_column}'")
+                        
+                        # Select only permno and the factor column to keep the merge clean
+                        factor_df = df[['permno', factor_column]].copy()
+                        
+                        # Rename the factor column to the factor name for clarity
+                        factor_df.rename(columns={factor_column: factor_path}, inplace=True)
+                        
+                        # Merge with existing data or create new DataFrame
+                        if merged_df is None:
+                            merged_df = factor_df
+                        else:
+                            merged_df = pd.merge(merged_df, factor_df, on='permno', how='outer')
+                            
+                    except Exception as e:
+                        self.logger(f"Error loading {factor_path} factor: {str(e)}")
+                else:
+                    self.logger(f"Factor file not found: {factor_file}")
+            
+            if merged_df is None or len(merged_df) == 0:
+                self.logger("No factor data available for this date")
+                return {}
+                
+            # Set permno as index once all merges are complete
+            merged_df.set_index('permno', inplace=True)
+            
+            # Log the merged data shape
+            self.logger(f"Merged factor data: {merged_df.shape[0]} stocks, {merged_df.shape[1]} factors")
+            self.logger(f"Factor columns: {merged_df.columns.tolist()}")
+            
+            # Standardize the factors
+            standardized_df = pd.DataFrame(index=merged_df.index)
+            
+            for factor in raw_factor_list:
+                if factor in merged_df.columns:
+                    try:
+                        # Convert to float and remove NaN values
+                        temp = merged_df[factor].copy().apply(float).dropna()
+                        
+                        # Calculate median and MAD for outlier handling
+                        med = temp.median()
+                        mad = (abs(temp - temp.median())).median()
+                        
+                        # Winsorize extreme values
+                        temp[temp < (med - 3*mad)] = med - 3*mad
+                        temp[temp > (med + 3*mad)] = med + 3*mad
+                        
+                        # Apply zscore standardization
+                        standardized_df[factor] = pd.Series(
+                            index=temp.index,
+                            data=zscore(temp)
+                        )
+                        
+                        self.logger(f"Standardized {factor} factor")
+                        
+                    except Exception as e:
+                        self.logger(f"Error standardizing {factor}: {str(e)}")
+            
+            # Calculate portfolio weights
+            portfolio_value = self.trading.get_portfolio_value()
+            
+            # Skip if no positions or empty portfolio
+            if not self.trading.positions or portfolio_value <= 0:
+                self.logger("No positions or zero portfolio value, skipping Barra analysis")
+                return {}
+            
+            # Calculate portfolio weights
+            portfolio_weights = {}
+            for permno, position in self.trading.positions.items():
+                shares = position[1]
+                price = position[2]
+                position_value = shares * price
+                weight = position_value / portfolio_value
+                portfolio_weights[permno] = weight
+            
+            # Calculate standardized factor exposures
+            std_exposures = {}
+            exposure_coverage = {}
+            
+            for factor in raw_factor_list:
+                if factor in standardized_df.columns:
+                    std_exposures[factor] = 0.0
+                    exposure_coverage[factor] = 0.0
+                    
+                    for permno, weight in portfolio_weights.items():
+                        if permno in standardized_df.index and not pd.isna(standardized_df.loc[permno, factor]):
+                            factor_value = standardized_df.loc[permno, factor]
+                            
+                            # Skip NaN or infinite values
+                            if pd.notna(factor_value) and not np.isinf(factor_value):
+                                std_exposures[factor] += factor_value * weight
+                                exposure_coverage[factor] += weight
+            
+            # Calculate style factor exposures
+            style_exposures = {
+                'size': std_exposures.get('log_market_cap', 0.0),
+                'momentum': 0.5 * std_exposures.get('cum_return_252d_offset_21d', 0.0) + 
+                            0.5 * std_exposures.get('cum_return_126d_offset_21d', 0.0),
+                'value': std_exposures.get('book_to_price', 0.0)
+            }
+            
+            # Log style factor exposures
+            self.logger(f"\nBarra Style Factor Exposures for {date_str}:")
+            for style, exposure in style_exposures.items():
+                coverage = exposure_coverage.get(style, 0.0)
+                if style == 'momentum':
+                    coverage = (exposure_coverage.get('cum_return_252d_offset_21d', 0.0) + 
+                            exposure_coverage.get('cum_return_126d_offset_21d', 0.0)) / 2
+                self.logger(f"  {style.upper()}: {exposure:.4f} (Coverage: {coverage*100:.2f}%)")
+            
+            # Store both style and standardized exposures in history
+            if not hasattr(self, 'barra_history'):
+                self.barra_history = {}
+            
+            # Store combined results
+            combined_exposures = {**style_exposures, **std_exposures}
+            self.barra_history[date_str] = combined_exposures
+            
+            return combined_exposures
+            
+        except Exception as e:
+            self.logger(f"Error calculating Barra exposures: {str(e)}")
+            import traceback
+            self.logger(traceback.format_exc())
+            return {}
+
+
+
+
+
+    def plot_barra_exposures_summary(self, ax=None, interactive=True):
+        """
+        Plot Barra factor exposures on the provided axes
+        
+        Parameters:
+        -----------
+        ax : matplotlib.axes.Axes
+            Existing axes to plot on
+        interactive : bool
+            Whether to enable interactive features
+        
+        Returns:
+        --------
+        matplotlib.axes.Axes
+            The plot axes
+        """
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(12, 8))
+        
+        # If barra_history doesn't exist or is empty, show a message
+        if not hasattr(self, 'barra_history') or not self.barra_history:
+            ax.text(0.5, 0.5, "No Barra exposure data available", 
+                    horizontalalignment='center', verticalalignment='center',
+                    transform=ax.transAxes, fontsize=14)
+            return ax
+        
+        # Convert dictionary to DataFrame
+        barra_df = pd.DataFrame.from_dict(self.barra_history, orient='index')
+        barra_df.index = pd.to_datetime(barra_df.index)
+        barra_df = barra_df.sort_index()
+        
+        # Focus on main style factors
+        style_factors = ['size', 'momentum', 'value']
+        available_factors = [col for col in style_factors if col in barra_df.columns]
+        
+        if not available_factors:
+            ax.text(0.5, 0.5, "No style factors found in Barra data", 
+                    horizontalalignment='center', verticalalignment='center',
+                    transform=ax.transAxes, fontsize=14)
+            return ax
+        
+        # Plot each available style factor
+        lines = []
+        colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # Blue, orange, green
+        
+        for i, factor in enumerate(available_factors):
+            line = ax.plot(
+                barra_df.index, 
+                barra_df[factor], 
+                label=factor.title(), 
+                linewidth=2,
+                color=colors[i % len(colors)]
+            )[0]
+            lines.append(line)
+        
+        # Add zero line
+        ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        
+        # Customize plot
+        ax.set_title('Barra Style Factor Exposures', fontsize=12, pad=10)
+        ax.set_xlabel('Date', fontsize=10)
+        ax.set_ylabel('Factor Exposure (Z-Score)', fontsize=10)
+        ax.grid(True, linestyle='--', alpha=0.7)
+        ax.legend(fontsize=10)
+        
+        # Add interactive hover information if requested
+        if interactive :
+            cursor = mplcursors.cursor(lines, hover=True)
+            
+            @cursor.connect("add")
+            def on_hover(sel):
+                x, y = sel.target
+                date_idx = np.abs(matplotlib.dates.date2num(barra_df.index) - x).argmin()
+                date_str = barra_df.index[date_idx].strftime('%Y-%m-%d')
+                factor = sel.artist.get_label().lower()
+                
+                sel.annotation.set_text(
+                    f"{factor.title()} Exposure\n"
+                    f"Date: {date_str}\n"
+                    f"Value: {y:.4f}"
+                )
+                sel.annotation.get_bbox_patch().set(fc="white", alpha=0.8)
+        
+        return ax

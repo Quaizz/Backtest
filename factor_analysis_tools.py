@@ -1296,7 +1296,7 @@ class USQuantileFactorAnalysis:
     def plot_performance_summary(self, interactive=False):
         """Create comprehensive performance summary plot with benchmark and universe comparison."""
         # Create figure with increased height to accommodate tables
-        num_years = len(self.trading_date) // 252  # Estimate number of years based on trading days (252 per year)
+        num_years = max(len(self.trading_date) // 252, 1)  # Estimate number of years based on trading days (252 per year)
         base_height = 70  # Base height for plots
         table_height = max(3, num_years * 5)  # Adjust table height dynamically
         total_height = base_height + table_height  # Total height for figure
